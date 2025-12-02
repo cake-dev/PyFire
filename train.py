@@ -9,9 +9,9 @@ from dataset_parallel import FireEmulationDataset
 from model import UNetFireEmulator3D as UNetFireEmulator
 
 # --- Hyperparameters ---
-BATCH_SIZE = 32         
+BATCH_SIZE = 24         
 LEARNING_RATE = 1e-4
-EPOCHS = 50             
+EPOCHS = 30             
 DATA_DIR = "./training_data_v1"
 CHECKPOINT_DIR = "./checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -20,36 +20,53 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
-class WeightedMSELoss(nn.Module):
-    def __init__(self, weight=500.0): # INCREASED FROM 50 to 500
+class ContiguousGrowthLoss(nn.Module):
+    def __init__(self, active_weight=10.0, growth_penalty=1.0, tv_weight=0.5):
         super().__init__()
-        self.weight = weight
+        self.active_weight = active_weight
+        self.growth_penalty = growth_penalty
+        self.tv_weight = tv_weight
         self.mse = nn.MSELoss(reduction='none')
 
     def forward(self, pred, target):
         loss = self.mse(pred, target)
-        # Mask: High weight where there IS fire activity
-        # Since we scaled targets by 1000x, meaningful activity is > 0.1
-        mask = (torch.abs(target) > 0.1).float() 
         
-        weighted_loss = loss * (1 + (self.weight - 1) * mask)
-        return weighted_loss.mean()
+        active_mask = (torch.abs(target) > 0.05).float()
+        underestimation_mask = (target > pred).float() * active_mask
+        
+        weight_map = 1.0 + (self.active_weight * active_mask)
+        weight_map = weight_map + (self.active_weight * self.growth_penalty * underestimation_mask)
+        
+        mse_loss = (loss * weight_map).mean()
+        
+        diff_d = torch.abs(pred[:, :, 1:, :, :] - pred[:, :, :-1, :, :]).mean()
+        diff_h = torch.abs(pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :]).mean()
+        diff_w = torch.abs(pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1]).mean()
+        tv_loss = diff_d + diff_h + diff_w
+        
+        return mse_loss + (self.tv_weight * tv_loss)
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
 
     full_dataset = FireEmulationDataset(DATA_DIR, cache_in_ram=False)
-    train_size = int(0.8 * len(full_dataset))
+    
+    train_size = int(0.9 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     
-    model = UNetFireEmulator(in_channels=5, out_channels=1).to(device)
-    criterion = WeightedMSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # UPDATED: in_channels=7
+    model = UNetFireEmulator(in_channels=7, out_channels=1).to(device)
+    
+    # NOTE: You MUST restart training from scratch (delete checkpoints) 
+    # because the input layer shape has changed.
+    
+    criterion = ContiguousGrowthLoss(active_weight=10.0, growth_penalty=1.0, tv_weight=0.5)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scaler = GradScaler('cuda')
     
     best_val_loss = float('inf')
@@ -68,13 +85,14 @@ def train():
                 loss = criterion(outputs, targets)
             
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
             running_loss += loss.item()
             loop.set_postfix(loss=loss.item())
             
-        # Validation
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
