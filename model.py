@@ -68,4 +68,4 @@ class UNetFireEmulator3D(nn.Module):
         x = self.conv3(x)
         
         logits = self.outc(x)
-        return F.relu(logits)
+        return F.relu(logits) # can change to softplus if needed (helps with smoothness when low values)

@@ -87,10 +87,6 @@ def transport_eps_kernel(ep_counts, n_ep_received, u, v, w, rng_states, dx, dy, 
                 vc = v[i, j, k]
                 wc = w[i, j, k]
                 
-                # We loop through packets or groups of packets to diffuse them
-                # Optimization: Move them in a single averaged chunk for speed
-                # but add substantial noise (turbulence)
-                
                 # Noise scale: Higher = more spread, less jumping
                 scale = 2.0 
                 
@@ -105,9 +101,10 @@ def transport_eps_kernel(ep_counts, n_ep_received, u, v, w, rng_states, dx, dy, 
                 # Bias upward (heat rises) + random vertical turbulence
                 dz_travel = (wc + wp * scale) + 2.0 
                 
-                dest_i = int(i + dx_travel / dx)
-                dest_j = int(j + dy_travel / dy)
-                dest_k = int(k + dz_travel / dz)
+                # FIX: Use round() to properly bin to nearest neighbor
+                dest_i = int(round(i + dx_travel / dx))
+                dest_j = int(round(j + dy_travel / dy))
+                dest_k = int(round(k + dz_travel / dz))
                 
                 # Bounds check
                 if 0 <= dest_i < nx and 0 <= dest_j < ny and 0 <= dest_k < nz:
@@ -126,9 +123,11 @@ def transport_eps_kernel(ep_counts, n_ep_received, u, v, w, rng_states, dx, dy, 
                 # Creeping is mostly horizontal, slight vertical chance
                 dz_c = (xoroshiro128p_uniform_float32(rng_states, rng_idx) - 0.2) 
                 
-                dest_i_c = int(i + dx_c / dx)
-                dest_j_c = int(j + dy_c / dy)
-                dest_k_c = int(k + dz_c / dz)
+                # FIX: Use round() here too. 
+                # Since dist (1.5) < dx (2.0), simple truncation always results in 0 offset.
+                dest_i_c = int(round(i + dx_c / dx))
+                dest_j_c = int(round(j + dy_c / dy))
+                dest_k_c = int(round(k + dz_c / dz))
                 
                 if 0 <= dest_i_c < nx and 0 <= dest_j_c < ny and 0 <= dest_k_c < nz:
                     cuda.atomic.add(n_ep_received, (dest_i_c, dest_j_c, dest_k_c), n_creeping)

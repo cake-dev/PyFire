@@ -11,7 +11,7 @@ import scipy.ndimage
 RR_SCALE = 1000.0 
 
 class FireEmulationDataset(Dataset):
-    def __init__(self, data_dir, cache_in_ram=True):
+    def __init__(self, data_dir, cache_in_ram=False): # Default to False for large datasets
         self.files = sorted(glob.glob(f"{data_dir}/*.npz"))
         self.cache_in_ram = cache_in_ram
         self.data_cache = []
@@ -32,15 +32,11 @@ class FireEmulationDataset(Dataset):
             return None
 
     def _load_file(self, filepath):
+        # OPTIMIZATION: Do NOT smooth here. Return raw data.
+        # Smoothing whole files repeatedly destroys training speed.
         with np.load(filepath) as data:
             fuel_map = data['fuel'].transpose(0, 3, 1, 2).astype(np.float32)
             rr_map = data['reaction_rate'].transpose(0, 3, 1, 2).astype(np.float32)
-            
-            # --- 1. SPATIAL & TEMPORAL SMOOTHING ---
-            # Sigma format: (Time, Z, X, Y)
-            # Time=0.5: Smooths "flicker" between frames
-            # Space=1.0: Smooths "dots" into connected blobs
-            rr_map = scipy.ndimage.gaussian_filter(rr_map, sigma=(0.5, 0.5, 1.0, 1.0))
             
             w_speed = data['wind_speed'][0] / 30.0
             w_dir = np.radians(data['wind_dir'][0])
@@ -60,6 +56,13 @@ class FireEmulationDataset(Dataset):
         if self.cache_in_ram: return len(self.data_cache)
         return len(self.files)
 
+    def _smooth_frame(self, frame):
+        """
+        Applies spatial smoothing to a single 3D frame (Z, X, Y).
+        Sigma (0.5, 1.0, 1.0) ensures connectivity without blurring Z too much.
+        """
+        return scipy.ndimage.gaussian_filter(frame, sigma=(0.5, 1.0, 1.0))
+
     def __getitem__(self, idx):
         if self.cache_in_ram: data = self.data_cache[idx]
         else: data = self._load_file(self.files[idx])
@@ -71,36 +74,53 @@ class FireEmulationDataset(Dataset):
         # Active Sampling
         if max_t < 2: t = 0
         else:
+            # Quick check: Use max projection to check for fire existence faster
             for _ in range(10):
-                t = np.random.randint(2, max_t + 1) # Start at 2 for history
-                if np.sum(rr_map[t]) > 0.01: break
+                t = np.random.randint(2, max_t + 1)
+                # Optimization: Check sum of a subsample to be faster
+                if np.sum(rr_map[t, :, ::4, ::4]) > 0.001: 
+                    break
 
         d, h, w = fuel_map.shape[1], fuel_map.shape[2], fuel_map.shape[3]
         
-        # Global params volumes
+        # Global params
         wx_vol = np.full((d, h, w), data['wx'], dtype=np.float32)
         wy_vol = np.full((d, h, w), data['wy'], dtype=np.float32)
         mst_vol = np.full((d, h, w), data['moist'], dtype=np.float32)
         
-        # --- 2. INPUT HISTORY STACK ---
-        # Instead of just T, we feed T, T-1, T-2
-        # This gives the model velocity and acceleration context
-        rr_t = rr_map[t] * RR_SCALE
-        rr_t_minus_1 = rr_map[t-1] * RR_SCALE
-        rr_t_minus_2 = rr_map[t-2] * RR_SCALE
+        # --- PREPARE FRAMES (Spatial Smoothing Only) ---
+        # We smooth only the 4 frames we actually use, not the whole 100-frame history.
+        
+        # Raw frames
+        raw_t = rr_map[t]
+        raw_tm1 = rr_map[t-1]
+        raw_tm2 = rr_map[t-2]
+        raw_tp1 = rr_map[t+1]
+        
+        # Apply smoothing locally
+        # Scale *after* smoothing to keep noise low
+        rr_t = self._smooth_frame(raw_t) * RR_SCALE
+        rr_tm1 = self._smooth_frame(raw_tm1) * RR_SCALE
+        rr_tm2 = self._smooth_frame(raw_tm2) * RR_SCALE
+        rr_tp1 = self._smooth_frame(raw_tp1) # Used for target
         
         input_stack = np.stack([
-            fuel_map[t],      # Channel 0: Fuel
-            rr_t,             # Channel 1: Current Fire
-            rr_t_minus_1,     # Channel 2: Past Fire -1
-            rr_t_minus_2,     # Channel 3: Past Fire -2
-            wx_vol,           # Channel 4: Wind X
-            wy_vol,           # Channel 5: Wind Y
-            mst_vol           # Channel 6: Moisture
+            fuel_map[t],      # Channel 0
+            rr_t,             # Channel 1 (Current)
+            rr_tm1,           # Channel 2 (t-1)
+            rr_tm2,           # Channel 3 (t-2)
+            wx_vol,           # Channel 4
+            wy_vol,           # Channel 5
+            mst_vol           # Channel 6
         ], axis=0)
         
-        # Target: Delta to T+1
-        delta_rr = (rr_map[t+1] - rr_map[t]) * RR_SCALE
+        # Target: Delta to smoothed T+1
+        # Predicting the smoothed path forces the model to ignore particle noise
+        delta_rr = (rr_tp1 - (raw_t)) * RR_SCALE 
+        # Note: We calculate delta from Raw T to Smoothed T+1 to encourage smoothing?
+        # Better: Smoothed T+1 - Smoothed T.
+        delta_rr = (rr_tp1 * RR_SCALE) - rr_t
+        
         target = delta_rr[None, :, :, :] 
 
         return torch.from_numpy(input_stack), torch.from_numpy(target)

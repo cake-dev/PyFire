@@ -2,6 +2,10 @@ import multiprocessing as mp
 import os
 import time
 import numpy as np
+import matplotlib
+# Set backend to Agg to avoid "display not found" errors on HPC/Headless servers
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import config
 import run_gpu
@@ -9,16 +13,17 @@ import world_gen
 
 # Output directory
 DATA_DIR = "./training_data_v1"
-NUM_SAMPLES = 1000
-NUM_WORKERS = 16  # A100 usually handles 8-10 small context streams easily
+STATS_DIR = "./training_data_v1_stats"
+NUM_SAMPLES = 1024
+NUM_WORKERS = 32  # A100 has 40GB VRAM, can handle multiple sims
 
 def generate_single_sample(run_id):
     """
     Worker function to run one full simulation cycle.
+    Returns: (success_bool, params_dict)
     """
     try:
         # 1. Generate Params (CPU Heavy)
-        # We perform world generation inside the worker to utilize CPU cores
         nx, ny, nz = config.NX, config.NY, config.NZ
         fuel_grid, terrain_grid = world_gen.generate_world(nx, ny, nz)
         
@@ -49,20 +54,68 @@ def generate_single_sample(run_id):
         }
 
         # 2. Run Simulation (GPU Heavy)
-        # Each process gets its own CUDA context
         run_gpu.run_simulation(params, run_id=run_id, output_dir=DATA_DIR)
         
-        return True
+        # Return params for statistics (exclude heavy arrays)
+        stats = {
+            'speed': speed,
+            'direction': direction,
+            'moisture': moisture
+        }
+        return True, stats
         
     except Exception as e:
         print(f"Run {run_id} failed: {e}")
-        return False
+        return False, None
+
+def plot_distributions(stats_list, output_dir):
+    """
+    Generates plots for the dataset distributions.
+    """
+    if not stats_list:
+        print("No stats to plot.")
+        return
+
+    speeds = [s['speed'] for s in stats_list]
+    directions = [s['direction'] for s in stats_list]
+    moistures = [s['moisture'] for s in stats_list]
+
+    fig = plt.figure(figsize=(18, 5))
+
+    # 1. Wind Speed Histogram
+    ax1 = fig.add_subplot(131)
+    ax1.hist(speeds, bins=20, color='skyblue', edgecolor='black', alpha=0.7)
+    ax1.set_title('Wind Speed Distribution (m/s)')
+    ax1.set_xlabel('Speed (m/s)')
+    ax1.set_ylabel('Count')
+
+    # 2. Wind Direction (Polar Rose Plot)
+    ax2 = fig.add_subplot(132, projection='polar')
+    # Convert degrees to radians for polar plot
+    rads = np.radians(directions)
+    ax2.hist(rads, bins=36, color='salmon', edgecolor='black', alpha=0.7)
+    ax2.set_title('Wind Direction Distribution')
+    ax2.set_theta_zero_location('N') # 0 degrees at top
+    ax2.set_theta_direction(-1)      # Clockwise
+
+    # 3. Moisture Histogram
+    ax3 = fig.add_subplot(133)
+    ax3.hist(moistures, bins=20, color='lightgreen', edgecolor='black', alpha=0.7)
+    ax3.set_title('Fuel Moisture Distribution')
+    ax3.set_xlabel('Moisture Factor')
+    ax3.set_ylabel('Count')
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "dataset_stats.png")
+    plt.savefig(plot_path)
+    print(f"Distribution plots saved to {plot_path}")
+    plt.close()
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(STATS_DIR, exist_ok=True)
     
-    # CRITICAL: Numba/CUDA requires 'spawn' start method to handle contexts correctly
-    # 'fork' (default on Linux) will crash CUDA
+    # CRITICAL: Numba/CUDA requires 'spawn' start method
     try:
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
@@ -71,19 +124,30 @@ def main():
     print(f"Generating {NUM_SAMPLES} simulations with {NUM_WORKERS} parallel workers...")
     start_time = time.time()
     
+    successful_stats = []
+
     # Create a pool of workers
     with mp.Pool(processes=NUM_WORKERS) as pool:
-        # Map the worker function to the range of IDs
-        # tqdm wrapper for progress bar
+        # Use imap_unordered for better parallel efficiency
         results = list(tqdm(pool.imap_unordered(generate_single_sample, range(NUM_SAMPLES)), total=NUM_SAMPLES))
+        
+    # Process results
+    success_count = 0
+    for success, stats in results:
+        if success:
+            success_count += 1
+            successful_stats.append(stats)
     
-    success_count = sum(results)
     end_time = time.time()
     duration = end_time - start_time
     
     print(f"Completed {success_count}/{NUM_SAMPLES} runs.")
     print(f"Total time: {duration:.2f}s")
     print(f"Average time per sample: {duration/NUM_SAMPLES:.2f}s")
+    
+    # Generate Plots
+    print("Generating distribution statistics...")
+    plot_distributions(successful_stats, STATS_DIR)
 
 if __name__ == "__main__":
     main()

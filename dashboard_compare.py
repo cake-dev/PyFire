@@ -58,9 +58,16 @@ def calculate_ros_map(rr_vol):
 def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, wind_info, title_prefix=""):
     current_rr = rr_vol[t] 
     
-    top_fuel = np.max(fuel_static, axis=2) 
+    # Check if fuel_static is (Time, X, Y, Z) or (X, Y, Z)
+    if len(fuel_static.shape) == 4:
+        # If we have dynamic fuel history, use frame t
+        current_fuel = fuel_static[t]
+    else:
+        current_fuel = fuel_static
+
+    top_fuel = np.max(current_fuel, axis=2) 
     top_fire = np.max(current_rr, axis=2)
-    side_fuel = np.max(fuel_static, axis=1) 
+    side_fuel = np.max(current_fuel, axis=1) 
     side_fire = np.max(current_rr, axis=1)
     side_terrain = np.max(terrain, axis=1) 
 
@@ -102,8 +109,8 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
     ax4.set_title("Terrain Skyline")
     ax4.fill_between(range(len(side_terrain)), side_terrain, color='#4d3b2a', alpha=0.8)
     if np.max(side_fire) > 0.05:
-         ax4.imshow(side_fire.T, cmap='hot', vmin=0, vmax=1.0, alpha=0.3, origin='lower', aspect='auto', extent=[0, len(side_terrain), 0, fuel_static.shape[2]])
-    ax4.set_ylim(0, fuel_static.shape[2])
+         ax4.imshow(side_fire.T, cmap='hot', vmin=0, vmax=1.0, alpha=0.3, origin='lower', aspect='auto', extent=[0, len(side_terrain), 0, current_fuel.shape[2]])
+    ax4.set_ylim(0, current_fuel.shape[2])
     ax4.set_xlim(0, len(side_terrain))
 
     fig.canvas.draw()
@@ -116,7 +123,6 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
 @st.cache_resource
 def load_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # MODEL UPDATED to 7 channels
     model = UNetFireEmulator3D(in_channels=7, out_channels=1).to(device)
     try:
         model.load_state_dict(torch.load("checkpoints/best_model.pth", map_location=device))
@@ -126,6 +132,7 @@ def load_model():
     model.eval()
     return model
 
+# --- MAIN ---
 if 'generated_data' not in st.session_state: st.session_state['generated_data'] = None
 
 st.sidebar.title("🔥 Controls")
@@ -218,7 +225,7 @@ if st.session_state['generated_data']:
         
         steps = len(sim_rr_history)
 
-        # 2. RUN EMULATOR (With History)
+        # 2. RUN EMULATOR (With History & Physics Constraint)
         st.write("Running AI Emulator...")
         model = load_model()
         if model is None: st.stop()
@@ -232,8 +239,7 @@ if st.session_state['generated_data']:
         curr_rr = torch.from_numpy(curr_rr_np).float().unsqueeze(0).to(device) * RR_SCALE
         curr_fuel = torch.from_numpy(curr_fuel_np).float().unsqueeze(0).to(device)
         
-        # History Buffer (RR_t, RR_{t-1}, RR_{t-2})
-        # Initialize with current state duplicated
+        # History Buffer
         rr_t = curr_rr
         rr_t_minus_1 = curr_rr.clone()
         rr_t_minus_2 = curr_rr.clone()
@@ -248,14 +254,18 @@ if st.session_state['generated_data']:
         t_mst = torch.full((1, nz, nx, ny), p['moisture'], device=device).float()
         
         emu_rr_list = []
+        emu_fuel_list = [] # Store fuel consumption for viz
+        
         progress_bar = st.progress(0)
         
         with torch.no_grad():
             for t in range(steps):
+                # Save frame
                 frame_xyz = rr_t.cpu().numpy()[0].transpose(1, 2, 0) / RR_SCALE
                 emu_rr_list.append(frame_xyz)
+                emu_fuel_list.append(curr_fuel.cpu().numpy()[0].transpose(1, 2, 0))
                 
-                # Stack: Fuel, RR_t, RR_{t-1}, RR_{t-2}, Wind...
+                # Stack inputs
                 inputs = torch.stack([
                     curr_fuel[0], 
                     rr_t[0], 
@@ -266,8 +276,25 @@ if st.session_state['generated_data']:
                 
                 pred = model(inputs).squeeze(1)
                 
-                # Update
-                next_rr = torch.clamp(rr_t + pred, 0, 2.0 * RR_SCALE)
+                # --- UPDATE REACTION RATE ---
+                next_rr = rr_t + pred
+                
+                # 1. NOISE GATE: Kill tiny values to prevent infinite spread
+                # If unscaled RR < 0.005, kill it. (0.005 * 1000 = 5.0)
+                next_rr[next_rr < 5.0] = 0.0
+                
+                # 2. FUEL GATE: If no fuel, no fire
+                # This prevents "ghost fire" on burnt ground
+                next_rr[curr_fuel < 0.01] = 0.0
+                
+                # 3. CLAMP
+                next_rr = torch.clamp(next_rr, 0, 2.0 * RR_SCALE)
+                
+                # --- UPDATE FUEL (CRITICAL FOR BURNOUT) ---
+                # Physics: Fuel change = - ReactionRate * dt
+                # RR is scaled by 1000 in the model, so divide back
+                consumption = (next_rr / RR_SCALE) * DT
+                curr_fuel = torch.clamp(curr_fuel - consumption, min=0.0)
                 
                 # Shift History
                 rr_t_minus_2 = rr_t_minus_1
@@ -277,6 +304,7 @@ if st.session_state['generated_data']:
                 progress_bar.progress((t+1)/steps)
         
         emu_rr_history = np.stack(emu_rr_list) 
+        emu_fuel_history = np.stack(emu_fuel_list)
 
         # 3. RENDER
         st.write("Rendering Visualization...")
@@ -289,7 +317,8 @@ if st.session_state['generated_data']:
             img_sim = render_single_panel(t, data['fuel'], sim_rr_history, data['terrain'], 
                                         sim_ros, sim_arrival, (p['wind_speed'], p['wind_dir']), "PHYSICS SIM")
             
-            img_emu = render_single_panel(t, data['fuel'], emu_rr_history, data['terrain'], 
+            # Pass DYNAMIC fuel history to Emulator renderer
+            img_emu = render_single_panel(t, emu_fuel_history, emu_rr_history, data['terrain'], 
                                         emu_ros, emu_arrival, (p['wind_speed'], p['wind_dir']), "AI EMULATOR")
             
             combined = np.concatenate([img_sim, img_emu], axis=1)
