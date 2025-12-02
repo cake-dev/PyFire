@@ -1,0 +1,3 @@
+training_data_v1/*.npz
+__pycache__/
+checkpoints/
