@@ -3,25 +3,38 @@ from numba import cuda
 import config
 
 @cuda.jit
+def extract_wind_slices_kernel(u, v, w, out_buffer, z_indices):
+    """
+    Extracts U, V, W vectors at specific z-indices.
+    out_buffer shape: (num_layers, 3_components, nx, ny)
+    """
+    i, j = cuda.grid(2)
+    nx, ny, nz = u.shape
+    n_layers = out_buffer.shape[0]
+    
+    if i < nx and j < ny:
+        for l in range(n_layers):
+            k = z_indices[l]
+            if k >= 0 and k < nz:
+                out_buffer[l, 0, i, j] = u[i, j, k]
+                out_buffer[l, 1, i, j] = v[i, j, k]
+                out_buffer[l, 2, i, j] = w[i, j, k]
+
+@cuda.jit
 def project_wind_over_terrain_kernel(u, v, w, elevation, dx, dy):
     i, j, k = cuda.grid(3)
     nx, ny, nz = u.shape
     
     if i < nx and j < ny and k < nz:
-        # Clamp indices for finite difference
         i_next = min(i + 1, nx - 1)
         i_prev = max(i - 1, 0)
         j_next = min(j + 1, ny - 1)
         j_prev = max(j - 1, 0)
         
-        # Calculate gradients (elevation is 2D, access with i, j)
         dz_dx = (elevation[i_next, j] - elevation[i_prev, j]) / (2.0 * dx)
         dz_dy = (elevation[i, j_next] - elevation[i, j_prev]) / (2.0 * dy)
         
-        # Calculate terrain induced vertical velocity
         w_terrain = u[i, j, k] * dz_dx + v[i, j, k] * dz_dy
-        
-        # Add to existing w
         w[i, j, k] += w_terrain
 
 @cuda.jit
@@ -30,17 +43,14 @@ def apply_drag_kernel(u, fuel_density, fuel_density_0, z_coords, u_ref, z_ref, k
     nx, ny, nz = u.shape
     
     if i < nx and j < ny and k < nz:
-        # Height above GROUND
         z = z_coords[k] + 0.5 * dz
         
-        # Log profile calculation
         if z <= z0:
             u_log = 0.0
         else:
             u_star = u_ref * k_vk / math.log(z_ref / z0)
             u_log = (u_star / k_vk) * math.log(z / z0)
         
-        # Apply Drag
         if fuel_density_0[i, j, k] > 0:
             attenuation = 0.3
             fuel_frac = fuel_density[i, j, k] / fuel_density_0[i, j, k]
@@ -63,9 +73,6 @@ def apply_buoyancy_kernel(w, reaction_rate, dx, dy, dz, g, rho_air, cp_air, t_am
             
 @cuda.jit
 def rotate_wind_kernel(u, v, wind_rad):
-    """
-    Projects the magnitude U into U and V components based on wind direction.
-    """
     i, j, k = cuda.grid(3)
     nx, ny, nz = u.shape
     

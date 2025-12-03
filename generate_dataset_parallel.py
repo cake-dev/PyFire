@@ -12,10 +12,10 @@ import run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_test"
-STATS_DIR = "./training_data_test_stats"
-NUM_SAMPLES = 1024
-NUM_WORKERS = 32  # A100 has 40GB VRAM, can handle multiple sims
+DATA_DIR = "./training_data_test2"
+STATS_DIR = "./training_data_test_stats2"
+NUM_SAMPLES = 2
+NUM_WORKERS = 1  # A100 has 40GB VRAM, can handle multiple sims
 
 def generate_single_sample(run_id):
     """

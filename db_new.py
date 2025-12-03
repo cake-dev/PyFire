@@ -33,16 +33,21 @@ DX = config.DX
 DT = config.DT
 
 # --- MODEL REGISTRY ---
+# TYPE KEY:
+# "standard": Expects Linear Input (0-1000), Outputs Linear Delta
+# "swin": Expects Log Input (0-7), Outputs Log Delta
 MODEL_REGISTRY = {
     "Standard UNet": {
         "class": UNetFireEmulator3D,
         "dir": "checkpoints",
-        "kwargs": {"in_channels": 7, "out_channels": 1}
+        "kwargs": {"in_channels": 7, "out_channels": 1},
+        "type": "standard" 
     },
     "Swin Transformer": {
         "class": SwinUNetFireEmulator,
         "dir": "checkpoints_swin",
-        "kwargs": {"in_channels": 7, "out_channels": 1, "img_size": (config.NZ, config.NX, config.NY)}
+        "kwargs": {"in_channels": 7, "out_channels": 1, "img_size": (config.NZ, config.NX, config.NY)},
+        "type": "swin" 
     }
 }
 
@@ -50,7 +55,13 @@ st.set_page_config(page_title="3D Fire Emulator vs Simulator", layout="wide", pa
 
 # --- HELPER FUNCTIONS ---
 def standardize_grid(arr_4d):
+    """
+    Ensures grid is (Time, Z, X, Y) for compatibility.
+    Handles legacy (Time, X, Y, Z) by checking dimension sizes.
+    """
     shape = arr_4d.shape
+    # Heuristic: Z is usually smaller than X and Y. 
+    # If last dim is smallest, it's likely (X, Y, Z) -> needs transpose.
     if shape[-1] < shape[-2] and shape[-1] < shape[-3]:
         arr_4d = arr_4d.transpose(0, 3, 1, 2)
     return np.ascontiguousarray(arr_4d)
@@ -80,15 +91,14 @@ def calculate_ros_map(rr_vol):
     return arrival_indices, ros_map
 
 def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, wind_info, title_prefix=""):
+    t = min(t, len(rr_vol) - 1)
     current_rr = rr_vol[t] 
     
     if len(fuel_static.shape) == 4:
-        current_fuel = fuel_static[t]
+        current_fuel = fuel_static[min(t, len(fuel_static)-1)]
     else:
         current_fuel = fuel_static
 
-    # Data Shapes (Standardized): (Z, X, Y)
-    
     # 1. Top-Down (Max over Z) -> Shape (X, Y)
     top_fuel = np.max(current_fuel, axis=0) 
     top_fire = np.max(current_rr, axis=0)
@@ -113,10 +123,6 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
     fig.suptitle(f"{title_prefix} | T={t}s | Wind: {w_spd:.1f}m/s {w_dir:.0f}°", fontsize=16, fontweight='bold')
 
     # --- Top-Down ---
-    # Input (X, Y). We want X horizontal, Y vertical? 
-    # Usually maps are (X=Col, Y=Row) or (Row, Col).
-    # If we want standard cartesian: imshow(A.T, origin='lower') puts X on axis 0 (horizontal), Y on axis 1 (vertical)
-    # Let's stick to what worked for Top-Down (it looked okay in screenshots).
     ax1.set_title("Top-Down (Fuel + Fire)")
     ax1.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, origin='lower')
     ax1.contour(terrain.T, levels=8, colors='white', alpha=0.3, linewidths=0.5)
@@ -124,12 +130,7 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
     ax1.set_ylabel("Y (m)")
     ax1.set_xlabel("X (m)")
 
-    # --- Side View (FIXED) ---
-    # Input is (Z, X). We want X horizontal, Z vertical.
-    # imshow(A, origin='lower') treats A as (Rows, Cols).
-    # If we pass (Z, X), Rows=Z, Cols=X.
-    # With origin='lower', Row 0 (Z=0) is bottom.
-    # So we should pass 'side_fuel' DIRECTLY, NOT TRANSPOSED.
+    # --- Side View ---
     ax2.set_title("Side View (X-Z Projection)")
     ax2.imshow(side_fuel, cmap='Greens', vmin=0, vmax=2.0, origin='lower', aspect='auto')
     ax2.imshow(side_fire, cmap='hot', vmin=0.0, vmax=1.0, alpha=0.9, origin='lower', aspect='auto')
@@ -148,16 +149,10 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
 
     # --- Skyline ---
     ax4.set_title("Terrain Skyline")
-    # side_terrain is (X,). We plot against range(len).
     ax4.fill_between(range(len(side_terrain)), side_terrain, color='#4d3b2a', alpha=0.8)
-    
-    # Overlay fire side view (faintly)
     if np.max(side_fire) > 0.05:
-         # Extent needs to match plot coordinates: [X_min, X_max, Z_min, Z_max]
-         # side_fire is (Z, X).
          ax4.imshow(side_fire, cmap='hot', vmin=0, vmax=1.0, alpha=0.3, origin='lower', aspect='auto', 
                     extent=[0, side_fire.shape[1], 0, side_fire.shape[0]])
-    
     ax4.set_ylim(0, current_fuel.shape[0]) 
     ax4.set_xlim(0, len(side_terrain))
     ax4.set_xlabel("X (m)")
@@ -263,6 +258,7 @@ else:
         if st.sidebar.button("Load Run"):
             with st.spinner("Loading..."):
                 with np.load(selected_file) as data:
+                    # Standardize grid to (Time, Z, X, Y)
                     fuel_hist = standardize_grid(data['fuel'])
                     rr_hist = standardize_grid(data['reaction_rate'])
                     
@@ -271,8 +267,7 @@ else:
                     else:
                         terrain_grid = data.get('custom_terrain', np.zeros((fuel_hist.shape[2], fuel_hist.shape[3])))
                     
-                    # --- FIX: Find first valid start frame ---
-                    # Sometimes frame 0 is empty. Scan for first non-zero frame.
+                    # Find first valid start frame
                     start_idx = 0
                     for i in range(len(rr_hist)):
                         if np.max(rr_hist[i]) > 0.01:
@@ -283,7 +278,7 @@ else:
                         'fuel': fuel_hist[start_idx], 
                         'terrain': terrain_grid,
                         'rr': rr_hist[start_idx],     
-                        'full_history_rr': rr_hist[start_idx:], # Trim history to start
+                        'full_history_rr': rr_hist[start_idx:], 
                         'full_history_fuel': fuel_hist[start_idx:], 
                         'ignition_points': [],
                         'params': {'wind_speed': data['wind_speed'][0], 'wind_dir': data['wind_dir'][0], 'moisture': data['moisture'][0]},
@@ -334,24 +329,19 @@ if st.session_state['generated_data']:
         if model is None: st.stop()
         
         device = next(model.parameters()).device
+        model_type = MODEL_REGISTRY[model_choice]["type"]
         
         # --- INITIALIZATION ---
-        if data.get('source') == 'loaded':
-            start_rr = data['rr'] # Already set to start_idx frame
-            start_fuel = data['fuel']
-        else:
-            start_rr = data['rr']
-            start_fuel = data['fuel']
+        start_rr = data['rr']
+        start_fuel = data['fuel']
 
         curr_rr = torch.from_numpy(start_rr).float().unsqueeze(0).to(device)
         curr_fuel = torch.from_numpy(start_fuel).float().unsqueeze(0).to(device)
         
-        # Check for empty start
-        if curr_rr.max() == 0:
-            st.warning("Warning: Initial Fire State is empty (Max RR = 0). Emulator may produce blank output.")
-        
+        # Apply scaling to get into "Physical" units (1.0 -> 1000.0)
         curr_rr = curr_rr * RR_SCALE
-
+        
+        # History approximation
         rr_t = curr_rr
         rr_t_minus_1 = curr_rr.clone()
         rr_t_minus_2 = curr_rr.clone()
@@ -372,6 +362,7 @@ if st.session_state['generated_data']:
         
         with torch.no_grad():
             for t in range(steps):
+                # Save purely linear data for visualization
                 frame_xyz = rr_t.cpu().numpy()[0] / RR_SCALE
                 emu_rr_list.append(frame_xyz)
                 emu_fuel_list.append(curr_fuel.cpu().numpy()[0])
@@ -384,21 +375,34 @@ if st.session_state['generated_data']:
                     t_wx[0], t_wy[0], t_mst[0]
                 ], dim=0).unsqueeze(0)
                 
-                # Log transform the RR input channels before feeding to model
-                # RR is at index 1, 2, 3 (t, t-1, t-2)
+                # --- INTELLIGENT PREPROCESSING ---
                 model_inputs = inputs.clone()
-                model_inputs[:, 1] = torch.log1p(model_inputs[:, 1])
-                model_inputs[:, 2] = torch.log1p(model_inputs[:, 2])
-                model_inputs[:, 3] = torch.log1p(model_inputs[:, 3])
+                
+                if model_type == "swin":
+                    # Swin Training uses Log inputs
+                    model_inputs[:, 1] = torch.log1p(model_inputs[:, 1])
+                    model_inputs[:, 2] = torch.log1p(model_inputs[:, 2]) 
+                    model_inputs[:, 3] = torch.log1p(model_inputs[:, 3])
+                elif model_type == "standard":
+                    # Standard Training uses Linear inputs (Do nothing)
+                    pass 
 
+                # Inference
                 pred = model(model_inputs).squeeze(1)
                 
-                # Inverse transform prediction (Exp) to get back to linear space
-                pred = torch.expm1(pred)
+                # --- INTELLIGENT POSTPROCESSING ---
+                if model_type == "swin":
+                    # Swin Targets were log transformed -> Inverse is expm1
+                    pred = torch.expm1(pred)
+                elif model_type == "standard":
+                    # Standard Targets were linear -> No transform
+                    pass
                 
+                # Apply update
                 next_rr = rr_t + pred
                 
-                next_rr[next_rr < 5.0] = 0.0
+                # Lower threshold to allow small fire growth (Critical Fix)
+                next_rr[next_rr < 0.1] = 0.0 
                 next_rr[curr_fuel < 0.01] = 0.0
                 next_rr = torch.clamp(next_rr, 0, 2.0 * RR_SCALE)
                 
@@ -409,7 +413,7 @@ if st.session_state['generated_data']:
                 rr_t_minus_1 = rr_t
                 rr_t = next_rr
                 
-                progress_bar.progress((t+1)/steps)
+                progress_bar.progress(min((t+1)/steps, 1.0))
         
         emu_rr_history = np.stack(emu_rr_list) 
         emu_fuel_history = np.stack(emu_fuel_list)

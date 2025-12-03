@@ -16,7 +16,7 @@ import torch.nn.functional as F
 BATCH_SIZE = 8          
 LEARNING_RATE = 2e-5    
 EPOCHS = 30             
-DATA_DIR = "./training_data_v1"
+DATA_DIR = "./training_data_test"
 CHECKPOINT_DIR = "./checkpoints_swin"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
