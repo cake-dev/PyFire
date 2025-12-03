@@ -1,4 +1,4 @@
-training_data_v1/*.npz
+training_data*/
 __pycache__/
 checkpoints*/
 emu_models*/

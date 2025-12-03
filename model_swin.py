@@ -28,13 +28,17 @@ class SwinUNetFireEmulator(nn.Module):
             
             class MODEL:
                 DROP_RATE = 0.0
-                DROP_PATH_RATE = 0.2
+                DROP_PATH_RATE = 0.3 # Increase drop path slightly for deeper models
                 
                 class SWIN:
                     PATCH_SIZE = (2, 2, 2) 
                     IN_CHANS = in_channels
                     EMBED_DIM = 48 
-                    DEPTHS = (2, 2, 2, 2)
+                    # INCREASE DEPTH
+                    # Old: (2, 2, 2, 2) -> 8 layers total
+                    # New: (2, 4, 4, 2) -> 12 layers total. 
+                    # The middle layers are crucial for spatial mixing.
+                    DEPTHS = (2, 4, 4, 2) 
                     NUM_HEADS = (3, 6, 12, 24)
                     WINDOW_SIZE = (7, 7, 7)
         

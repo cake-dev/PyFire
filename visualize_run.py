@@ -6,7 +6,7 @@ import argparse
 from tqdm import tqdm
 import scipy.ndimage
 
-DATA_DIR = "./training_data_v1"
+DATA_DIR = "./training_data_test"
 OUTPUT_DIR = "./visualizations"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

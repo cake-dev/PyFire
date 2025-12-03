@@ -12,7 +12,6 @@ import tempfile
 from collections import deque
 
 # --- IMPORT MODELS ---
-# Wrap in try/except to prevent crashing if files are missing
 try:
     from model import UNetFireEmulator3D 
 except ImportError:
@@ -28,13 +27,12 @@ import world_gen
 import run_gpu 
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_v1"
+DATA_DIR = "./training_data_test"
 RR_SCALE = 1000.0 
 DX = config.DX
 DT = config.DT
 
 # --- MODEL REGISTRY ---
-# Defines how to instantiate each model type
 MODEL_REGISTRY = {
     "Standard UNet": {
         "class": UNetFireEmulator3D,
@@ -44,7 +42,6 @@ MODEL_REGISTRY = {
     "Swin Transformer": {
         "class": SwinUNetFireEmulator,
         "dir": "checkpoints_swin",
-        # Swin needs img_size to build the bottleneck layers correctly
         "kwargs": {"in_channels": 7, "out_channels": 1, "img_size": (config.NZ, config.NX, config.NY)}
     }
 }
@@ -54,13 +51,13 @@ st.set_page_config(page_title="3D Fire Emulator vs Simulator", layout="wide", pa
 # --- HELPER FUNCTIONS ---
 def standardize_grid(arr_4d):
     shape = arr_4d.shape
-    if shape[1] < shape[2] and shape[1] < shape[3]:
-        arr_4d = arr_4d.transpose(0, 2, 3, 1)
+    if shape[-1] < shape[-2] and shape[-1] < shape[-3]:
+        arr_4d = arr_4d.transpose(0, 3, 1, 2)
     return np.ascontiguousarray(arr_4d)
 
 def calculate_ros_map(rr_vol):
     if len(rr_vol.shape) == 4:
-        rr_vol_flat = np.max(rr_vol, axis=3)
+        rr_vol_flat = np.max(rr_vol, axis=1) 
     else:
         rr_vol_flat = rr_vol
 
@@ -85,17 +82,22 @@ def calculate_ros_map(rr_vol):
 def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, wind_info, title_prefix=""):
     current_rr = rr_vol[t] 
     
-    # Check if fuel_static is (Time, X, Y, Z) or (X, Y, Z)
     if len(fuel_static.shape) == 4:
-        # If we have dynamic fuel history, use frame t
         current_fuel = fuel_static[t]
     else:
         current_fuel = fuel_static
 
-    top_fuel = np.max(current_fuel, axis=2) 
-    top_fire = np.max(current_rr, axis=2)
-    side_fuel = np.max(current_fuel, axis=1) 
-    side_fire = np.max(current_rr, axis=1)
+    # Data Shapes (Standardized): (Z, X, Y)
+    
+    # 1. Top-Down (Max over Z) -> Shape (X, Y)
+    top_fuel = np.max(current_fuel, axis=0) 
+    top_fire = np.max(current_rr, axis=0)
+    
+    # 2. Side View (Max over Y) -> Shape (Z, X)
+    side_fuel = np.max(current_fuel, axis=2) 
+    side_fire = np.max(current_rr, axis=2)
+    
+    # 3. Skyline (Max over Y) -> Shape (X,)
     side_terrain = np.max(terrain, axis=1) 
 
     fig = plt.figure(figsize=(12, 8), dpi=80) 
@@ -110,20 +112,31 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
     w_spd, w_dir = wind_info
     fig.suptitle(f"{title_prefix} | T={t}s | Wind: {w_spd:.1f}m/s {w_dir:.0f}°", fontsize=16, fontweight='bold')
 
-    # Top-Down
+    # --- Top-Down ---
+    # Input (X, Y). We want X horizontal, Y vertical? 
+    # Usually maps are (X=Col, Y=Row) or (Row, Col).
+    # If we want standard cartesian: imshow(A.T, origin='lower') puts X on axis 0 (horizontal), Y on axis 1 (vertical)
+    # Let's stick to what worked for Top-Down (it looked okay in screenshots).
     ax1.set_title("Top-Down (Fuel + Fire)")
     ax1.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, origin='lower')
     ax1.contour(terrain.T, levels=8, colors='white', alpha=0.3, linewidths=0.5)
     ax1.imshow(top_fire.T, cmap='hot', vmin=0.0, vmax=1.0, alpha=0.7, origin='lower')
     ax1.set_ylabel("Y (m)")
+    ax1.set_xlabel("X (m)")
 
-    # Side View
+    # --- Side View (FIXED) ---
+    # Input is (Z, X). We want X horizontal, Z vertical.
+    # imshow(A, origin='lower') treats A as (Rows, Cols).
+    # If we pass (Z, X), Rows=Z, Cols=X.
+    # With origin='lower', Row 0 (Z=0) is bottom.
+    # So we should pass 'side_fuel' DIRECTLY, NOT TRANSPOSED.
     ax2.set_title("Side View (X-Z Projection)")
-    ax2.imshow(side_fuel.T, cmap='Greens', vmin=0, vmax=2.0, origin='lower', aspect='auto')
-    ax2.imshow(side_fire.T, cmap='hot', vmin=0.0, vmax=1.0, alpha=0.9, origin='lower', aspect='auto')
+    ax2.imshow(side_fuel, cmap='Greens', vmin=0, vmax=2.0, origin='lower', aspect='auto')
+    ax2.imshow(side_fire, cmap='hot', vmin=0.0, vmax=1.0, alpha=0.9, origin='lower', aspect='auto')
     ax2.set_ylabel("Z (Height)")
+    ax2.set_xlabel("X (m)")
 
-    # ROS
+    # --- ROS ---
     ax3.set_title("Rate of Spread (m/s)")
     mask = arrival_map > t 
     masked_ros = np.ma.masked_where(mask | (ros_map == 0), ros_map)
@@ -131,14 +144,24 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
     im3 = ax3.imshow(masked_ros.T, cmap='jet', vmin=0, vmax=5.0, origin='lower')
     plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
     ax3.set_ylabel("Y (m)")
+    ax3.set_xlabel("X (m)")
 
-    # Skyline
+    # --- Skyline ---
     ax4.set_title("Terrain Skyline")
+    # side_terrain is (X,). We plot against range(len).
     ax4.fill_between(range(len(side_terrain)), side_terrain, color='#4d3b2a', alpha=0.8)
+    
+    # Overlay fire side view (faintly)
     if np.max(side_fire) > 0.05:
-         ax4.imshow(side_fire.T, cmap='hot', vmin=0, vmax=1.0, alpha=0.3, origin='lower', aspect='auto', extent=[0, len(side_terrain), 0, current_fuel.shape[2]])
-    ax4.set_ylim(0, current_fuel.shape[2])
+         # Extent needs to match plot coordinates: [X_min, X_max, Z_min, Z_max]
+         # side_fire is (Z, X).
+         ax4.imshow(side_fire, cmap='hot', vmin=0, vmax=1.0, alpha=0.3, origin='lower', aspect='auto', 
+                    extent=[0, side_fire.shape[1], 0, side_fire.shape[0]])
+    
+    ax4.set_ylim(0, current_fuel.shape[0]) 
     ax4.set_xlim(0, len(side_terrain))
+    ax4.set_xlabel("X (m)")
+    ax4.set_ylabel("Z (Height)")
 
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
@@ -147,28 +170,20 @@ def render_single_panel(t, fuel_static, rr_vol, terrain, ros_map, arrival_map, w
     plt.close(fig)
     return image
 
-# --- MODEL LOADING LOGIC ---
 @st.cache_resource
 def load_model_dynamic(model_key, checkpoint_name):
-    """
-    Loads a model based on the registry key and specific checkpoint file.
-    """
     conf = MODEL_REGISTRY[model_key]
-    
     if conf["class"] is None:
         st.error(f"Class for {model_key} not imported. Check model files.")
         return None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Instantiate Model
     try:
         model = conf["class"](**conf["kwargs"]).to(device)
     except Exception as e:
         st.error(f"Error instantiating {model_key}: {e}")
         return None
 
-    # Load Weights
     ckpt_path = os.path.join(conf["dir"], checkpoint_name)
     try:
         state_dict = torch.load(ckpt_path, map_location=device)
@@ -188,11 +203,9 @@ if 'generated_data' not in st.session_state: st.session_state['generated_data'] 
 
 st.sidebar.title("🔥 Fire Emu Controls")
 
-# --- 1. MODEL SELECTOR ---
 st.sidebar.header("1. AI Model")
 model_choice = st.sidebar.selectbox("Architecture", list(MODEL_REGISTRY.keys()))
 
-# Scan directory for checkpoints
 ckpt_dir = MODEL_REGISTRY[model_choice]["dir"]
 if os.path.exists(ckpt_dir):
     ckpts = [f for f in os.listdir(ckpt_dir) if f.endswith(".pth")]
@@ -206,7 +219,6 @@ if not ckpts:
 else:
     selected_ckpt = st.sidebar.selectbox("Checkpoint", ckpts)
 
-# --- 2. DATA SOURCE ---
 st.sidebar.header("2. Scenario")
 mode = st.sidebar.radio("Data Source", ["Generate Random World", "Load Existing Run"])
 
@@ -219,7 +231,7 @@ if mode == "Generate Random World":
     if st.sidebar.button("Generate World"):
         with st.spinner("Generating..."):
             fuel_raw, terrain_grid = world_gen.generate_world(nx, ny, nz)
-            fuel_grid = np.ascontiguousarray(fuel_raw.transpose(1, 2, 0))
+            fuel_grid = fuel_raw 
             
             speed = np.random.uniform(5.0, 25.0) 
             direction = np.random.uniform(0.0, 360.0)
@@ -230,7 +242,7 @@ if mode == "Generate Random World":
             ignition_list = [{'x': int(ig_x), 'y': int(ig_y), 'z': int(ig_z)}]
             
             rr_grid = np.zeros_like(fuel_grid)
-            if 0 <= ig_z < nz: rr_grid[ig_x, ig_y, ig_z] = 1.0
+            if 0 <= ig_z < nz: rr_grid[ig_z, ig_x, ig_y] = 1.0 
 
             st.session_state['generated_data'] = {
                 'fuel': fuel_grid, 
@@ -254,17 +266,31 @@ else:
                     fuel_hist = standardize_grid(data['fuel'])
                     rr_hist = standardize_grid(data['reaction_rate'])
                     
+                    if 'terrain' in data:
+                        terrain_grid = data['terrain']
+                    else:
+                        terrain_grid = data.get('custom_terrain', np.zeros((fuel_hist.shape[2], fuel_hist.shape[3])))
+                    
+                    # --- FIX: Find first valid start frame ---
+                    # Sometimes frame 0 is empty. Scan for first non-zero frame.
+                    start_idx = 0
+                    for i in range(len(rr_hist)):
+                        if np.max(rr_hist[i]) > 0.01:
+                            start_idx = i
+                            break
+                    
                     st.session_state['generated_data'] = {
-                        'fuel': fuel_hist[0],
-                        'terrain': data.get('custom_terrain', np.zeros((fuel_hist.shape[1], fuel_hist.shape[2]))),
-                        'rr': rr_hist[0],
-                        'full_history_rr': rr_hist,
+                        'fuel': fuel_hist[start_idx], 
+                        'terrain': terrain_grid,
+                        'rr': rr_hist[start_idx],     
+                        'full_history_rr': rr_hist[start_idx:], # Trim history to start
+                        'full_history_fuel': fuel_hist[start_idx:], 
                         'ignition_points': [],
                         'params': {'wind_speed': data['wind_speed'][0], 'wind_dir': data['wind_dir'][0], 'moisture': data['moisture'][0]},
                         'source': 'loaded',
-                        'steps': len(rr_hist)
+                        'steps': len(rr_hist) - start_idx
                     }
-            st.success("File Loaded.")
+            st.success(f"File Loaded (Starting from Frame {start_idx}).")
 
 if st.session_state['generated_data']:
     data = st.session_state['generated_data']
@@ -272,12 +298,11 @@ if st.session_state['generated_data']:
     st.info(f"Wind: {p['wind_speed']:.1f} m/s @ {p['wind_dir']:.0f}° | Moisture: {p['moisture']:.2f}")
 
     if st.button("Run Comparison", type="primary"):
-        # VALIDATION
         if not selected_ckpt:
             st.error("Please select a valid model checkpoint.")
             st.stop()
 
-        # 1. RUN SIMULATOR
+        # 1. RUN SIMULATOR (Or use loaded)
         sim_rr_history = None
         if data.get('source') == 'loaded':
             sim_rr_history = data['full_history_rr']
@@ -287,7 +312,7 @@ if st.session_state['generated_data']:
                     old_time = config.TOTAL_TIME
                     config.TOTAL_TIME = float(data['steps'] * config.DT)
                     
-                    fuel_for_sim = np.ascontiguousarray(data['fuel'].transpose(2, 0, 1))
+                    fuel_for_sim = data['fuel'] 
                     
                     run_gpu.run_simulation({
                         'wind_speed': p['wind_speed'], 'wind_dir': p['wind_dir'], 'moisture': p['moisture'],
@@ -302,28 +327,36 @@ if st.session_state['generated_data']:
         
         steps = len(sim_rr_history)
 
-        # 2. RUN EMULATOR (With History & Physics Constraint)
+        # 2. RUN EMULATOR
         st.write(f"Running AI Emulator ({model_choice})...")
         
-        # Load the selected model dynamically
         model = load_model_dynamic(model_choice, selected_ckpt)
         if model is None: st.stop()
         
         device = next(model.parameters()).device
         
-        # Init State
-        curr_rr_np = np.ascontiguousarray(data['rr'].transpose(2, 0, 1))
-        curr_fuel_np = np.ascontiguousarray(data['fuel'].transpose(2, 0, 1))
+        # --- INITIALIZATION ---
+        if data.get('source') == 'loaded':
+            start_rr = data['rr'] # Already set to start_idx frame
+            start_fuel = data['fuel']
+        else:
+            start_rr = data['rr']
+            start_fuel = data['fuel']
+
+        curr_rr = torch.from_numpy(start_rr).float().unsqueeze(0).to(device)
+        curr_fuel = torch.from_numpy(start_fuel).float().unsqueeze(0).to(device)
         
-        curr_rr = torch.from_numpy(curr_rr_np).float().unsqueeze(0).to(device) * RR_SCALE
-        curr_fuel = torch.from_numpy(curr_fuel_np).float().unsqueeze(0).to(device)
+        # Check for empty start
+        if curr_rr.max() == 0:
+            st.warning("Warning: Initial Fire State is empty (Max RR = 0). Emulator may produce blank output.")
         
-        # History Buffer
+        curr_rr = curr_rr * RR_SCALE
+
         rr_t = curr_rr
         rr_t_minus_1 = curr_rr.clone()
         rr_t_minus_2 = curr_rr.clone()
         
-        nz, nx, ny = curr_rr_np.shape
+        nz, nx, ny = start_rr.shape
         w_rad = np.radians(p['wind_dir'])
         wx = np.cos(w_rad)*(p['wind_speed']/30.0)
         wy = np.sin(w_rad)*(p['wind_speed']/30.0)
@@ -333,19 +366,16 @@ if st.session_state['generated_data']:
         t_mst = torch.full((1, nz, nx, ny), p['moisture'], device=device).float()
         
         emu_rr_list = []
-        emu_fuel_list = [] # Store fuel consumption for viz
+        emu_fuel_list = [] 
         
         progress_bar = st.progress(0)
         
         with torch.no_grad():
             for t in range(steps):
-                # Save frame
-                frame_xyz = rr_t.cpu().numpy()[0].transpose(1, 2, 0) / RR_SCALE
+                frame_xyz = rr_t.cpu().numpy()[0] / RR_SCALE
                 emu_rr_list.append(frame_xyz)
-                emu_fuel_list.append(curr_fuel.cpu().numpy()[0].transpose(1, 2, 0))
+                emu_fuel_list.append(curr_fuel.cpu().numpy()[0])
                 
-                # Stack inputs
-                # Shape: (1, 7, NZ, NX, NY)
                 inputs = torch.stack([
                     curr_fuel[0], 
                     rr_t[0], 
@@ -354,25 +384,27 @@ if st.session_state['generated_data']:
                     t_wx[0], t_wy[0], t_mst[0]
                 ], dim=0).unsqueeze(0)
                 
-                pred = model(inputs).squeeze(1)
+                # Log transform the RR input channels before feeding to model
+                # RR is at index 1, 2, 3 (t, t-1, t-2)
+                model_inputs = inputs.clone()
+                model_inputs[:, 1] = torch.log1p(model_inputs[:, 1])
+                model_inputs[:, 2] = torch.log1p(model_inputs[:, 2])
+                model_inputs[:, 3] = torch.log1p(model_inputs[:, 3])
+
+                pred = model(model_inputs).squeeze(1)
                 
-                # --- UPDATE REACTION RATE ---
+                # Inverse transform prediction (Exp) to get back to linear space
+                pred = torch.expm1(pred)
+                
                 next_rr = rr_t + pred
                 
-                # 1. NOISE GATE
                 next_rr[next_rr < 5.0] = 0.0
-                
-                # 2. FUEL GATE
                 next_rr[curr_fuel < 0.01] = 0.0
-                
-                # 3. CLAMP
                 next_rr = torch.clamp(next_rr, 0, 2.0 * RR_SCALE)
                 
-                # --- UPDATE FUEL (CRITICAL FOR BURNOUT) ---
                 consumption = (next_rr / RR_SCALE) * DT
                 curr_fuel = torch.clamp(curr_fuel - consumption, min=0.0)
                 
-                # Shift History
                 rr_t_minus_2 = rr_t_minus_1
                 rr_t_minus_1 = rr_t
                 rr_t = next_rr
@@ -382,19 +414,23 @@ if st.session_state['generated_data']:
         emu_rr_history = np.stack(emu_rr_list) 
         emu_fuel_history = np.stack(emu_fuel_list)
 
-        # 3. RENDER
         st.write("Rendering Visualization...")
         
         sim_arrival, sim_ros = calculate_ros_map(sim_rr_history)
         emu_arrival, emu_ros = calculate_ros_map(emu_rr_history)
         
         video_frames = []
-        # Render every 2nd frame for speed
+        
+        # Use full history if available, else generated fuel
+        if data.get('source') == 'loaded':
+            sim_fuel_hist = data['full_history_fuel']
+        else:
+            sim_fuel_hist = data['fuel']
+
         for t in range(0, steps, 2):
-            img_sim = render_single_panel(t, data['fuel'], sim_rr_history, data['terrain'], 
+            img_sim = render_single_panel(t, sim_fuel_hist, sim_rr_history, data['terrain'], 
                                           sim_ros, sim_arrival, (p['wind_speed'], p['wind_dir']), "PHYSICS SIM")
             
-            # Pass DYNAMIC fuel history to Emulator renderer
             img_emu = render_single_panel(t, emu_fuel_history, emu_rr_history, data['terrain'], 
                                           emu_ros, emu_arrival, (p['wind_speed'], p['wind_dir']), f"AI EMULATOR ({model_choice})")
             

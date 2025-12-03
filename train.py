@@ -12,7 +12,7 @@ from model import UNetFireEmulator3D as UNetFireEmulator
 BATCH_SIZE = 24         
 LEARNING_RATE = 1e-4
 EPOCHS = 30             
-DATA_DIR = "./training_data_v1"
+DATA_DIR = "./training_data_test"
 CHECKPOINT_DIR = "./checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 

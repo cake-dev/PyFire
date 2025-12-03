@@ -8,7 +8,7 @@ DZ = 1.0  # meters (vertical resolution can be stretched, but keeping uniform fo
 
 # Time
 DT = 1.0  # seconds
-TOTAL_TIME = 128  # seconds
+TOTAL_TIME = 256  # seconds
 SAVE_INTERVAL = 1  # Save every N steps (can adjust higher to save space, but lose temporal res)
 
 # Physics Constants

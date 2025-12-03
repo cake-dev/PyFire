@@ -12,8 +12,8 @@ import run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_v1"
-STATS_DIR = "./training_data_v1_stats"
+DATA_DIR = "./training_data_test"
+STATS_DIR = "./training_data_test_stats"
 NUM_SAMPLES = 1024
 NUM_WORKERS = 32  # A100 has 40GB VRAM, can handle multiple sims
 
@@ -30,6 +30,11 @@ def generate_single_sample(run_id):
         speed = np.random.uniform(0.0, 25.0)
         direction = np.random.uniform(0.0, 360.0)
         moisture = np.random.uniform(0.1, 1.5)
+
+        # defaults
+        # speed = 4.0
+        # direction = 90.0
+        # moisture = 0.2
         
         # Smart Ignition Logic
         ig_x, ig_y, ig_z = 0, 0, 0
@@ -43,7 +48,8 @@ def generate_single_sample(run_id):
         else:
             ig_x, ig_y = nx // 2, ny // 2
             ig_z = int(terrain_grid[ig_x, ig_y])
-
+        ig_x, ig_y = nx // 2, ny // 2
+        ig_z = int(terrain_grid[ig_x, ig_y])
         params = {
             'wind_speed': speed,
             'wind_dir': direction,
