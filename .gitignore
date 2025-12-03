@@ -1,4 +1,5 @@
-training_data*/
+training_*/
 __pycache__/
 checkpoints*/
 emu_models*/
+visualizations/
