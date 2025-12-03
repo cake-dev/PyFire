@@ -1,4 +1,7 @@
 import numpy as np
+import matplotlib
+# Set backend to Agg before importing pyplot to ensure headless, thread-safe rendering
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import imageio.v3 as iio
@@ -6,6 +9,8 @@ import os
 import argparse
 from tqdm import tqdm
 import scipy.ndimage
+import multiprocessing as mp
+from functools import partial
 
 # --- CONFIGURATION ---
 DATA_DIR = "./training_data_new_wind_2"
@@ -15,6 +20,18 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 DX = 2.0
 DY = 2.0
 DT = 1.0
+
+# --- GLOBAL SHARED DATA (For Worker Processes) ---
+# These are initialized in each worker process to avoid pickling large arrays repeatedly
+shared_data = {}
+
+def init_worker(fuel, rr, terrain, ros_map, arrival_indices):
+    """Initialize global data for worker processes."""
+    shared_data['fuel'] = fuel
+    shared_data['rr'] = rr
+    shared_data['terrain'] = terrain
+    shared_data['ros_map'] = ros_map
+    shared_data['arrival_indices'] = arrival_indices
 
 def load_data(run_id):
     filename = f"run_{run_id}.npz"
@@ -69,8 +86,30 @@ def calculate_ros_map(rr_vol):
     
     return arrival_indices, ros_map
 
-def render_frame(t, fuel_vol, rr_vol, terrain, ros_map, arrival_map, wind_tuple, wind_info, 
-                 h_wind_data, v_wind_data, h_title, v_title):
+def render_worker(frame_data):
+    """
+    Worker function to render a single frame.
+    frame_data contains frame-specific scalar/small array data.
+    Large static arrays are accessed via shared_data.
+    """
+    t = frame_data['t']
+    u_grid = frame_data['u']
+    v_grid = frame_data['v']
+    w_grid = frame_data['w']
+    h_data = frame_data['h_data']
+    v_data = frame_data['v_data']
+    wind_info = frame_data['wind_info']
+    h_title = frame_data['h_title']
+    v_title = frame_data['v_title']
+
+    # Access shared heavy data
+    fuel_vol = shared_data['fuel']
+    rr_vol = shared_data['rr']
+    terrain = shared_data['terrain']
+    ros_map = shared_data['ros_map']
+    arrival_map = shared_data['arrival_indices']
+
+    # --- RENDER LOGIC ---
     f_t = fuel_vol[t]
     r_t = rr_vol[t]
     
@@ -79,21 +118,14 @@ def render_frame(t, fuel_vol, rr_vol, terrain, ros_map, arrival_map, wind_tuple,
     side_fuel = np.max(f_t, axis=1)
     side_fire = np.max(r_t, axis=1)
     
-    # Unpack smoothed instantaneous winds (not strictly used for history plots, but available)
-    u_grid, v_grid, w_grid = wind_tuple
-
     w_spd, w_dir = wind_info
 
-    # --- LAYOUT SETUP ---
-    # 2 Rows, 3 Columns
-    # Top Row: [Top-Down (1 col)] [Side View (2 cols)]
-    # Bottom Row: [ROS (1 col)] [Horiz Wind (1 col)] [Vert Wind (1 col)]
-    
+    # Create figure (headless)
     fig = plt.figure(figsize=(20, 10), dpi=80)
     gs = gridspec.GridSpec(2, 3, height_ratios=[1, 1], width_ratios=[1, 1, 1])
     
     ax1 = fig.add_subplot(gs[0, 0])      # Top Left
-    ax2 = fig.add_subplot(gs[0, 1:])     # Top Right (Spans 2 cols)
+    ax2 = fig.add_subplot(gs[0, 1:])     # Top Right
     ax3 = fig.add_subplot(gs[1, 0])      # Bottom Left
     ax4 = fig.add_subplot(gs[1, 1])      # Bottom Middle
     ax5 = fig.add_subplot(gs[1, 2])      # Bottom Right
@@ -108,14 +140,14 @@ def render_frame(t, fuel_vol, rr_vol, terrain, ros_map, arrival_map, wind_tuple,
     ax1.set_ylabel("Y Distance")
     ax1.set_xlabel("X Distance")
 
-    # 2. Side View (Spans 2 columns now)
+    # 2. Side View
     ax2.set_title("Side View (XZ Profile)")
     ax2.imshow(side_fuel.T, cmap='Greens', vmin=0, vmax=2.0, origin='lower', aspect='auto', interpolation='nearest')
     ax2.imshow(side_fire.T, cmap='hot', vmin=0.0, vmax=1.0, alpha=0.9, origin='lower', aspect='auto', interpolation='nearest')
     ax2.set_ylabel("Z Height")
     ax2.set_xlabel("X Distance")
 
-    # 3. ROS (Bottom Left)
+    # 3. ROS
     ax3.set_title("Instantaneous Rate of Spread (m/s)")
     mask = arrival_map > t 
     masked_ros = np.ma.masked_where(mask | (ros_map == 0), ros_map)
@@ -125,19 +157,15 @@ def render_frame(t, fuel_vol, rr_vol, terrain, ros_map, arrival_map, wind_tuple,
     ax3.set_ylabel("Y Distance")
     ax3.set_xlabel("X Distance")
 
-    # 4. Horizontal Wind Field (Bottom Middle)
+    # 4. Horizontal Wind Field
     ax4.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, alpha=0.3, origin='lower', interpolation='nearest')
     ax4.set_title(h_title)
     
-    # Mask values close to global wind (ambient)
-    # Using a slightly smaller epsilon (0.05) to capture subtle gusts
-    masked_wind = np.ma.masked_where(h_wind_data < (w_spd + 0.05), h_wind_data)
+    masked_wind = np.ma.masked_where(h_data < (w_spd + 0.05), h_data)
     ax4.set_facecolor('darkgray') 
     
-    # Plot Magnitude Heatmap
     im4 = ax4.imshow(masked_wind.T, cmap='viridis', origin='lower', vmin=0, vmax=15.0, interpolation='nearest')
     
-    # Global Wind Vector Overlay
     u_glob = np.cos(np.radians(w_dir + 180))
     v_glob = np.sin(np.radians(w_dir + 180))
     
@@ -150,23 +178,18 @@ def render_frame(t, fuel_vol, rr_vol, terrain, ros_map, arrival_map, wind_tuple,
              ha='center', va='top', fontsize=8, color='black', fontweight='bold', 
              bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
 
-    # Overlay Fire Contour
     ax4.contour(top_fire.T, levels=[0.1], colors='black', linewidths=0.8, alpha=0.5)
     plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04).set_label('Speed (m/s)')
     ax4.set_xlabel("X Distance")
     
-    # 5. Vertical Wind Field (Bottom Right)
+    # 5. Vertical Wind Field
     ax5.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, alpha=0.3, origin='lower', interpolation='nearest')
     ax5.set_title(v_title)
     
-    # Mask values near 0
-    masked_w = np.ma.masked_where(np.abs(v_wind_data) < 0.1, v_wind_data)
+    masked_w = np.ma.masked_where(np.abs(v_data) < 0.1, v_data)
     ax5.set_facecolor('darkgray')
     
-    # Plot Vertical W
     im5 = ax5.imshow(masked_w.T, cmap='coolwarm', origin='lower', vmin=-1.0, vmax=5.0, interpolation='nearest')
-    
-    # Overlay Fire Contour
     ax5.contour(top_fire.T, levels=[0.1], colors='black', linewidths=0.8, alpha=0.5)
 
     plt.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04).set_label('W (m/s)')
@@ -174,10 +197,12 @@ def render_frame(t, fuel_vol, rr_vol, terrain, ros_map, arrival_map, wind_tuple,
 
     plt.tight_layout()
     
+    # Extract buffer
     fig.canvas.draw()
     image_flat = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
     image_rgba = image_flat.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-    plt.close(fig)
+    plt.close(fig) # Explicitly close to prevent memory leaks in worker
+    
     return image_rgba[:, :, :3]
 
 def main():
@@ -185,8 +210,8 @@ def main():
     parser.add_argument("run_id", type=int, help="ID of the run to visualize (e.g. 999)")
     parser.add_argument("--suffix", type=str, default="", help="Optional suffix for the output file")
     parser.add_argument("--wind_smooth", type=int, default=0, help="Kernel size for spatial smoothing (box average) of wind")
-    parser.add_argument("--history", type=str, choices=['on', 'off'], default='on', 
-                        help="Enable persistent history for wind plots (on/off). Default: on")
+    parser.add_argument("--history", type=str, choices=['on', 'off'], default='on', help="Enable persistent history for wind plots")
+    parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1), help="Number of render processes (default: cpu_count - 1)")
     args = parser.parse_args()
 
     print(f"Loading run_{args.run_id}...")
@@ -195,78 +220,88 @@ def main():
     fuel, rr, terrain, wind_local, wind_info = data
     
     print("Calculating Rate of Spread Map...")
-    _, ros_map = calculate_ros_map(rr)
-    
-    if rr.ndim == 4:
-        fire_2d = np.max(rr, axis=3)
-    else:
-        fire_2d = rr
-    is_burnt = fire_2d > 0.01
-    arrival_indices = np.argmax(is_burnt, axis=0).astype(float)
-
-    mode_str = "History" if args.history == 'on' else "Instant"
-    print(f"Rendering frames (Mode: {mode_str}, Smooth: {args.wind_smooth})...")
-    
-    frames = []
+    arrival_indices, ros_map = calculate_ros_map(rr)
     
     w_spd = wind_info[0]
 
-    # Initialize History buffers
-    # Initialize horizontal history with the global wind speed to prevent startup masking artifacts
+    # --- PHASE 1: PRE-CALCULATE PHYSICS & HISTORY (Sequential) ---
+    # We must do this sequentially because history at T depends on T-1.
+    # However, this part is fast. Rendering is the slow part.
+    
+    print("Pre-calculating wind history frames...")
+    
     max_h_mag_history = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
     max_w_history = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
+    
+    render_tasks = []
+    
+    h_title = "Max Wind Speed History @ 5m" if args.history == 'on' else "Instantaneous Wind Speed @ 5m"
+    v_title = "Max Vert Velocity History @ 5m" if args.history == 'on' else "Instantaneous Vertical Wind @ 5m"
 
-    # FPS = 10 for smaller file size and smoother playback
-    for t in tqdm(range(0, fuel.shape[0], 2)):
-        
-        # Default zero-grids if wind data missing
+    # Step through time to generate the data packet for each frame
+    for t in tqdm(range(0, fuel.shape[0], 2), desc="Physics Calc"):
         u_grid = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
         v_grid = np.zeros_like(u_grid)
         w_grid = np.zeros_like(u_grid)
-        
         current_mag = np.zeros_like(u_grid)
 
-        # Update Wind Data
         if wind_local is not None:
-            # Extract instantaneous raw wind
             u_grid = wind_local[t, 0, 0]
             v_grid = wind_local[t, 0, 1]
             w_grid = wind_local[t, 0, 2]
 
-            # --- SPATIAL SMOOTHING ---
             if args.wind_smooth > 0:
                 u_grid = scipy.ndimage.uniform_filter(u_grid, size=args.wind_smooth)
                 v_grid = scipy.ndimage.uniform_filter(v_grid, size=args.wind_smooth)
                 w_grid = scipy.ndimage.uniform_filter(w_grid, size=args.wind_smooth)
 
-            # --- CALCULATE MAGNITUDE ---
             current_mag = np.sqrt(u_grid**2 + v_grid**2)
             
-            # --- UPDATE HISTORY ---
-            # Horizontal: Accumulate maximum magnitude strictly
-            # We initialize mask where new data exceeds history to ensure clean updates
+            # Update History
             np.maximum(max_h_mag_history, current_mag, out=max_h_mag_history)
-
-            # Vertical: Track Max Deviation (Up/Down)
             update_mask_w = np.abs(w_grid) > np.abs(max_w_history)
             max_w_history[update_mask_w] = w_grid[update_mask_w]
         
-        # --- SELECT DATA FOR RENDERING ---
+        # Decide what data to ship to the renderer
         if args.history == 'on':
-            h_data = max_h_mag_history
-            v_data = max_w_history
-            h_title = "Max Wind Speed History (Most Extreme) @ 5m"
-            v_title = "Max Vertical Velocity History @ 5m"
+            h_data_frame = max_h_mag_history.copy()
+            v_data_frame = max_w_history.copy()
         else:
-            h_data = current_mag
-            v_data = w_grid
-            h_title = "Instantaneous Wind Speed @ 5m"
-            v_title = "Instantaneous Vertical Wind @ 5m"
+            h_data_frame = current_mag.copy()
+            v_data_frame = w_grid.copy()
 
-        frames.append(render_frame(t, fuel, rr, terrain, ros_map, arrival_indices, 
-                                   (u_grid, v_grid, w_grid), wind_info, 
-                                   h_data, v_data, h_title, v_title))
+        # Pack data for this frame
+        task_data = {
+            't': t,
+            'u': u_grid, # These are small 2D arrays, safe to pickle/copy
+            'v': v_grid,
+            'w': w_grid,
+            'h_data': h_data_frame,
+            'v_data': v_data_frame,
+            'wind_info': wind_info,
+            'h_title': h_title,
+            'v_title': v_title
+        }
+        render_tasks.append(task_data)
 
+    # --- PHASE 2: PARALLEL RENDERING ---
+    print(f"Rendering {len(render_tasks)} frames on {args.workers} CPUs...")
+    
+    # We use an initializer to pass the large static arrays (fuel, terrain) 
+    # to workers once, instead of pickling them for every task.
+    frames = []
+    
+    # Use 'fork' context on Linux/Mac if possible for zero-copy global access,
+    # but 'spawn' is safer for Matplotlib. We'll use standard Pool with initializer.
+    with mp.Pool(processes=args.workers, 
+                 initializer=init_worker, 
+                 initargs=(fuel, rr, terrain, ros_map, arrival_indices)) as pool:
+        
+        # imap ensures we can use tqdm, but results come out in order
+        for frame in tqdm(pool.imap(render_worker, render_tasks), total=len(render_tasks), desc="Rendering"):
+            frames.append(frame)
+
+    # --- SAVE VIDEO ---
     if args.suffix:
         output_path = os.path.join(OUTPUT_DIR, f"run_{args.run_id}_viz_{args.history}_{args.suffix}.mp4")
     else:

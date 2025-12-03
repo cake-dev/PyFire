@@ -14,6 +14,7 @@ LEARNING_RATE = 1e-4
 EPOCHS = 30             
 DATA_DIR = "./training_data_test"
 CHECKPOINT_DIR = "./checkpoints"
+RR_SCALE = 1000.0 # Match global config
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -39,6 +40,7 @@ class ContiguousGrowthLoss(nn.Module):
         
         mse_loss = (loss * weight_map).mean()
         
+        # Total Variation Loss (Smoothness)
         diff_d = torch.abs(pred[:, :, 1:, :, :] - pred[:, :, :-1, :, :]).mean()
         diff_h = torch.abs(pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :]).mean()
         diff_w = torch.abs(pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1]).mean()
@@ -59,11 +61,7 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True)
     
-    # UPDATED: in_channels=7
     model = UNetFireEmulator(in_channels=7, out_channels=1).to(device)
-    
-    # NOTE: You MUST restart training from scratch (delete checkpoints) 
-    # because the input layer shape has changed.
     
     criterion = ContiguousGrowthLoss(active_weight=10.0, growth_penalty=1.0, tv_weight=0.5)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
@@ -78,6 +76,15 @@ def train():
         
         for inputs, targets in loop:
             inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+            
+            # --- CRITICAL NEW PHYSICS FIX: Normalize Inputs ---
+            # Inputs come in scaled by RR_SCALE (0-1000). 
+            # We normalize to 0-1 so the UNet weights don't explode.
+            inputs[:, 1:4] = inputs[:, 1:4] / RR_SCALE
+            
+            # Normalize Targets too (-1 to +1 range)
+            targets = targets / RR_SCALE
+
             optimizer.zero_grad(set_to_none=True)
             
             with autocast('cuda'):
@@ -98,6 +105,11 @@ def train():
         with torch.no_grad():
             for inputs, targets in val_loader:
                 inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+                
+                # Apply same normalization in validation
+                inputs[:, 1:4] = inputs[:, 1:4] / RR_SCALE
+                targets = targets / RR_SCALE
+                
                 with autocast('cuda'):
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)

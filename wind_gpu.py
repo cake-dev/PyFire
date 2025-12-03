@@ -6,7 +6,6 @@ import config
 def extract_wind_slices_kernel(u, v, w, out_buffer, z_indices):
     """
     Extracts U, V, W vectors at specific z-indices.
-    out_buffer shape: (num_layers, 3_components, nx, ny)
     """
     i, j = cuda.grid(2)
     nx, ny, nz = u.shape
@@ -60,17 +59,41 @@ def apply_drag_kernel(u, fuel_density, fuel_density_0, z_coords, u_ref, z_ref, k
             u[i, j, k] = u_log
 
 @cuda.jit
-def apply_buoyancy_kernel(w, reaction_rate, dx, dy, dz, g, rho_air, cp_air, t_ambient, h_wood):
-    i, j, k = cuda.grid(3)
+def apply_buoyancy_column_kernel(w, reaction_rate, dx, dy, dz, g, rho_air, cp_air, t_ambient, h_wood):
+    """
+    NEW: Propagates heat UPWARDS through the column.
+    This creates a plume that extends into the layers ABOVE the fire.
+    """
+    # 2D Grid - We loop over Z inside the kernel to carry momentum up
+    i, j = cuda.grid(2)
     nx, ny, nz = w.shape
     
-    if i < nx and j < ny and k < nz:
-        if reaction_rate[i, j, k] > 0:
-            E = reaction_rate[i, j, k] * h_wood * (dx * dy * dz)
-            FB = g * E / (math.pi * rho_air * cp_air * t_ambient)
-            w_induced = FB**(1.0/3.0)
-            w[i, j, k] += w_induced
+    if i < nx and j < ny:
+        # State variable for the updraft velocity accumulating in this column
+        current_updraft = 0.0
+        
+        # Loop from ground (k=0) to top (k=nz-1)
+        for k in range(nz):
+            # 1. Decay the updraft from the cell below (Entrainment/Friction)
+            # 0.90 means the plume persists for about 10-15 cells vertically
+            current_updraft *= 0.90
             
+            # 2. Add NEW heat from THIS cell
+            rr = reaction_rate[i, j, k]
+            if rr > 0:
+                E = rr * h_wood * (dx * dy * dz)
+                FB = g * E / (math.pi * rho_air * cp_air * t_ambient)
+                
+                # Induced velocity from THIS fire cell
+                w_induced = FB**(1.0/3.0)
+                
+                # Add to the moving column
+                current_updraft += w_induced
+            
+            # 3. Apply the accumulated updraft to the wind field
+            # We ADD it to whatever terrain effect is already there
+            w[i, j, k] += current_updraft
+
 @cuda.jit
 def rotate_wind_kernel(u, v, wind_rad):
     i, j, k = cuda.grid(3)

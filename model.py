@@ -19,7 +19,7 @@ class DoubleConv3D(nn.Module):
         return self.double_conv(x)
 
 class UNetFireEmulator3D(nn.Module):
-    def __init__(self, in_channels=7, out_channels=1): # CHANGED FROM 5 TO 7
+    def __init__(self, in_channels=7, out_channels=1): 
         super(UNetFireEmulator3D, self).__init__()
         
         # Encoder
@@ -68,4 +68,9 @@ class UNetFireEmulator3D(nn.Module):
         x = self.conv3(x)
         
         logits = self.outc(x)
-        return F.relu(logits) # can change to softplus if needed (helps with smoothness when low values)
+        
+        # CRITICAL FIX: Removed F.relu(logits). 
+        # Regression targets (Delta RR) can be negative (decay). 
+        # ReLU was forcing outputs to be >= 0, causing "Dead ReLU" on initialization 
+        # and preventing the model from predicting fire dying down.
+        return logits

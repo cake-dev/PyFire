@@ -84,16 +84,13 @@ def run_simulation(params, run_id, output_dir):
     # --- Setup Wind Recording (5m, 10m, 15m) ---
     target_heights = [5.0, 10.0, 15.0]
     z_indices = [int(h / dz) for h in target_heights]
-    # Ensure indices are within bounds
     z_indices = [min(max(z, 0), nz-1) for z in z_indices]
     
     z_indices_dev = cuda.to_device(np.array(z_indices, dtype=np.int32))
-    
-    # Snapshot buffer: 3 layers, 3 components (u,v,w), nx, ny
     wind_snapshot_dev = cuda.device_array((3, 3, nx, ny), dtype=np.float32)
     
-    # 2D Kernel Configuration for wind slice extraction
-    tpb_2d = (16, 16)
+    # 2D Kernel Configuration
+    tpb_2d = (8, 8)
     bpg_2d = (
         (nx + tpb_2d[0] - 1) // tpb_2d[0],
         (ny + tpb_2d[1] - 1) // tpb_2d[1]
@@ -105,14 +102,15 @@ def run_simulation(params, run_id, output_dir):
     
     history_fuel = np.zeros((num_frames, nx, ny, nz), dtype=np.float16) 
     history_rr = np.zeros((num_frames, nx, ny, nz), dtype=np.float16)
-    # History Wind: (Time, Layers, Components, X, Y)
     history_wind = np.zeros((num_frames, 3, 3, nx, ny), dtype=np.float16)
     
     vol = dx * dy * dz
     frame_idx = 0
     
     for t in range(total_steps):
-        # Physics Pipeline
+        # --- Physics Pipeline ---
+        
+        # 1. Drag & Terrain (3D Kernels)
         wind_gpu.apply_drag_kernel[blocks_per_grid, threads_per_block](
             u_dev, fuel_dev, fuel_0_dev, z_coords_dev, wind_speed, 10.0, config.K_VON_KARMAN, config.Z0, config.DZ
         )
@@ -121,11 +119,14 @@ def run_simulation(params, run_id, output_dir):
         wind_gpu.project_wind_over_terrain_kernel[blocks_per_grid, threads_per_block](
             u_dev, v_dev, w_dev, elevation_dev, dx, dy
         )
-        wind_gpu.apply_buoyancy_kernel[blocks_per_grid, threads_per_block](
+        
+        # 2. Buoyancy (NEW: 2D Column Integration Kernel)
+        # We launch this with the 2D configuration (bpg_2d, tpb_2d)
+        wind_gpu.apply_buoyancy_column_kernel[bpg_2d, tpb_2d](
             w_dev, reaction_rate_dev, dx, dy, dz, config.G, config.RHO_AIR, config.CP_AIR, config.T_AMBIENT, config.H_WOOD
         )
         
-        # Fire Logic
+        # 3. Fire Logic
         fire_gpu.compute_reaction_and_fuel_kernel[blocks_per_grid, threads_per_block](
             fuel_dev, fuel_moisture_dev, 
             n_ep_received_dev, incoming_x_dev, incoming_y_dev, incoming_z_dev,
@@ -135,14 +136,13 @@ def run_simulation(params, run_id, output_dir):
             config.CP_WOOD, config.T_CRIT, config.T_AMBIENT
         )
         
-        # Zero transients
         gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](n_ep_received_dev)
         gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](incoming_x_dev)
         gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](incoming_y_dev)
         gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](incoming_z_dev)
         cuda.synchronize()
         
-        # Transport
+        # 4. Transport
         fire_gpu.transport_eps_kernel[blocks_per_grid, threads_per_block](
             ep_counts_dev, 
             n_ep_received_dev, incoming_x_dev, incoming_y_dev, incoming_z_dev,
@@ -150,12 +150,10 @@ def run_simulation(params, run_id, output_dir):
             u_dev, v_dev, w_dev, rng_states, dx, dy, dz
         )
 
-        # Recording
         if t % save_interval == 0 and frame_idx < num_frames:
             history_fuel[frame_idx] = fuel_dev.copy_to_host().astype(np.float16)
             history_rr[frame_idx] = reaction_rate_dev.copy_to_host().astype(np.float16)
             
-            # Extract Wind Slices
             wind_gpu.extract_wind_slices_kernel[bpg_2d, tpb_2d](
                 u_dev, v_dev, w_dev, wind_snapshot_dev, z_indices_dev
             )
@@ -168,9 +166,10 @@ def run_simulation(params, run_id, output_dir):
         filename,
         fuel=history_fuel,        
         reaction_rate=history_rr,
-        wind_local=history_wind, # NEW: The 3D wind slices
+        wind_local=history_wind,
         wind_speed=np.array([wind_speed]),
         wind_dir=np.array([wind_dir_deg]),
+        moisture=np.array([moisture]),
         terrain=elevation_host,
         wind_heights=np.array(target_heights)
     )
