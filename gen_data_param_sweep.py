@@ -11,17 +11,21 @@ import run_sweep
 import world_gen
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_sweep_3"
-STATS_DIR = "./training_data_sweep_stats"
+DATA_DIR = "./training_data_sweep_7"
+STATS_DIR = "./training_data_sweep_7_stats"
 NUM_WORKERS = 8
 
 # Define your parameter sweep here.
 # Each dictionary overrides the defaults in config.py for that specific run.
 PHYSICS_VARIANTS = [
-    {'name': 'dt_1_0_dx_2_0_jump_hack',      'dt': 1.0, 'dx': 2.0, 'mod_dt': False, 'jump_hack': True, 'eep': 50000.0},
-    {'name': 'dt_1_0_dx_1_0_jump_hack',      'dt': 1.0, 'dx': 1.0, 'mod_dt': False, 'jump_hack': True, 'eep': 50000.0},
-    {'name': 'dt_0_5_dx_2_0_jump_hack',      'dt': 0.5, 'dx': 2.0, 'mod_dt': False, 'jump_hack': True, 'eep': 50000.0},
-
+    {'name': 'dt_1_0_dx_2_0_slope0',      'dt': 1.0, 'dx': 2.0, 'mod_dt': False, 'jump_hack': False, 'eep': 50000.0, 'slope_factor': 0.0},
+    {'name': 'dt_1_0_dx_2_0_jump_hack_slope0',      'dt': 1.0, 'dx': 2.0, 'mod_dt': False, 'jump_hack': True, 'eep': 50000.0, 'slope_factor': 0.0},
+    {'name': 'dt_0_1_dx_2_0_slope0',      'dt': 0.1, 'dx': 2.0, 'mod_dt': False, 'jump_hack': False, 'eep': 50000.0, 'slope_factor': 0.0},
+    {'name': 'dt_0_1_dx_2_0_mod_dt_slope0',      'dt': 0.1, 'dx': 2.0, 'mod_dt': True, 'jump_hack': False, 'eep': 50000.0, 'slope_factor': 0.0},
+    {'name': 'dt_1_0_dx_2_0_slope4',      'dt': 1.0, 'dx': 2.0, 'mod_dt': False, 'jump_hack': False, 'eep': 50000.0, 'slope_factor': 4.0},
+    {'name': 'dt_1_0_dx_2_0_jump_hack_slope4',      'dt': 1.0, 'dx': 2.0, 'mod_dt': False, 'jump_hack': True, 'eep': 50000.0, 'slope_factor': 4.0},
+    {'name': 'dt_0_1_dx_2_0_slope4',      'dt': 0.1, 'dx': 2.0, 'mod_dt': True, 'jump_hack': True, 'eep': 50000.0, 'slope_factor': 4.0},
+    {'name': 'dt_0_1_dx_2_0_mod_dt_slope4',      'dt': 0.1, 'dx': 2.0, 'mod_dt': True, 'jump_hack': True, 'eep': 50000.0, 'slope_factor': 4.0},
 ]
 
 def generate_single_sample(args):
@@ -47,7 +51,7 @@ def generate_single_sample(args):
         # direction = np.random.uniform(0.0, 360.0)
         # moisture = np.random.uniform(0.1, 1.0)
 
-        speed = 20.0
+        speed = 10.0
         direction = 180.0
         moisture = 0.5
         
@@ -76,6 +80,7 @@ def generate_single_sample(args):
             'dy': variant.get('dx', config.DY), # Assuming square cells usually
             'mod_dt': variant.get('mod_dt', config.MOD_DT),
             'jump_hack': variant.get('jump_hack', config.JUMP_HACK),
+            'slope_factor': variant.get('slope_factor', config.SLOPE_FACTOR),
             'eep': variant.get('eep', config.EEP)
         }
 
@@ -93,7 +98,7 @@ def generate_single_sample(args):
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(STATS_DIR, exist_ok=True)
+    # os.makedirs(STATS_DIR, exist_ok=True)
     
     try:
         mp.set_start_method('spawn', force=True)

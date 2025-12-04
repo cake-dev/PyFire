@@ -12,7 +12,7 @@ class SwinUNetFireEmulator(nn.Module):
     """
     def __init__(
         self,
-        in_channels: int = 7,
+        in_channels: int = 8, # Updated to 8 (Fuel, RR, RR-1, RR-2, Wx, Wy, Moist, Terrain)
         out_channels: int = 1,
         img_size: tuple = (32, 128, 128), # (Depth, Height, Width) match config.NZ, NX, NY
         flatten_temporal_dimension: bool = False,
@@ -45,7 +45,6 @@ class SwinUNetFireEmulator(nn.Module):
         self.config = Config()
         
         # Initialize SwinUNETR using the custom class signature
-        # CRITICAL FIX: Removed 'img_size' from arguments
         self.swin_unet = SwinUNETR(
             in_channels=self.config.MODEL.SWIN.IN_CHANS,
             out_channels=out_channels,

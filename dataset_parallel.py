@@ -9,6 +9,8 @@ import scipy.ndimage
 
 # --- SCALING FACTOR ---
 RR_SCALE = 1000.0 
+# Max height for normalization (Approximate, based on config.NZ * DZ)
+MAX_HEIGHT = 50.0 
 
 class FireEmulationDataset(Dataset):
     def __init__(self, data_dir, cache_in_ram=False): 
@@ -28,7 +30,8 @@ class FireEmulationDataset(Dataset):
     def _load_file_safe(self, filepath):
         try:
             return self._load_file(filepath)
-        except Exception:
+        except Exception as e:
+            # print(f"Error loading {filepath}: {e}")
             return None
 
     def _load_file(self, filepath):
@@ -37,6 +40,15 @@ class FireEmulationDataset(Dataset):
             fuel_map = data['fuel'].transpose(0, 3, 1, 2).astype(np.float32)
             rr_map = data['reaction_rate'].transpose(0, 3, 1, 2).astype(np.float32)
             
+            # --- TERRAIN (Physics Critical) ---
+            # Terrain is usually (X, Y). We need to handle it.
+            if 'terrain' in data:
+                terrain = data['terrain'].astype(np.float32)
+            elif 'custom_terrain' in data:
+                terrain = data['custom_terrain'].astype(np.float32)
+            else:
+                terrain = np.zeros((fuel_map.shape[2], fuel_map.shape[3]), dtype=np.float32)
+
             # --- MOISTURE (Safety Check) ---
             if 'moisture' in data:
                 moist = data['moisture'][0]
@@ -44,33 +56,27 @@ class FireEmulationDataset(Dataset):
                 moist = 0.5 # Safe fallback
             
             # --- WIND (Vector vs Scalar) ---
-            # If we have 3D wind slices (New Format), use them!
             if 'wind_local' in data:
                 # Shape: (Time, Layers, Components, X, Y)
-                # Layer 1 is 10m height (Mid-canopy/Surface)
-                # Components: 0=U, 1=V
                 wind_local = data['wind_local']
-                
-                # Extract U and V at 10m height
-                # Normalize by 30.0 to keep in -1 to 1 range approx
+                # Extract U and V at 10m height (Layer 1 usually)
                 wx_map = wind_local[:, 1, 0, :, :] / 30.0 
                 wy_map = wind_local[:, 1, 1, :, :] / 30.0
-                
                 use_local_wind = True
             else:
-                # Fallback to global scalar (Old Format)
+                # Fallback to global scalar
                 w_speed = data['wind_speed'][0] / 30.0
                 w_dir = np.radians(data['wind_dir'][0])
                 wx_scalar = np.cos(w_dir) * w_speed
                 wy_scalar = np.sin(w_dir) * w_speed
-                
-                wx_map = wx_scalar # Placeholder
-                wy_map = wy_scalar # Placeholder
+                wx_map = wx_scalar 
+                wy_map = wy_scalar 
                 use_local_wind = False
 
             return {
                 'fuel': fuel_map,
                 'rr': rr_map,
+                'terrain': terrain,
                 'wx': wx_map,
                 'wy': wy_map,
                 'moist': moist,
@@ -93,10 +99,12 @@ class FireEmulationDataset(Dataset):
         rr_map = data['rr']
         max_t = fuel_map.shape[0] - 2 
         
+        # Pick a time slice where fire exists
         if max_t < 2: t = 0
         else:
             for _ in range(10):
                 t = np.random.randint(2, max_t + 1)
+                # Check for activity in the slice
                 if np.sum(rr_map[t, :, ::4, ::4]) > 0.001: 
                     break
 
@@ -104,27 +112,37 @@ class FireEmulationDataset(Dataset):
         
         # --- Construct Wind Channels ---
         if data['use_local']:
-            # Expand 2D wind map (X,Y) to 3D volume (D,X,Y)
-            # We repeat the wind plane across all Z layers
-            # Wind Map Shape: (Time, X, Y) -> Select t -> (X, Y)
             wx_plane = data['wx'][t]
             wy_plane = data['wy'][t]
-            
             wx_vol = np.tile(wx_plane[np.newaxis, :, :], (d, 1, 1)).astype(np.float32)
             wy_vol = np.tile(wy_plane[np.newaxis, :, :], (d, 1, 1)).astype(np.float32)
         else:
-            # Scalar expansion
             wx_vol = np.full((d, h, w), data['wx'], dtype=np.float32)
             wy_vol = np.full((d, h, w), data['wy'], dtype=np.float32)
 
         mst_vol = np.full((d, h, w), data['moist'], dtype=np.float32)
         
+        # --- Construct Terrain Channel ---
+        # Terrain is 2D (X, Y). We expand to 3D (D, X, Y) by repeating.
+        # This tells the 3D CNN the "elevation" at every voxel column.
+        terr_plane = data['terrain'] / MAX_HEIGHT
+        terr_vol = np.tile(terr_plane[np.newaxis, :, :], (d, 1, 1)).astype(np.float32)
+
         # --- Prepare Inputs (with Smoothing & Pre-Scaling) ---
         rr_t = self._smooth_frame(rr_map[t]) * RR_SCALE
         rr_tm1 = self._smooth_frame(rr_map[t-1]) * RR_SCALE
         rr_tm2 = self._smooth_frame(rr_map[t-2]) * RR_SCALE
         rr_tp1 = self._smooth_frame(rr_map[t+1]) # For target
         
+        # Input Stack: 8 Channels
+        # 0: Fuel Density
+        # 1: Reaction Rate (t)
+        # 2: Reaction Rate (t-1)
+        # 3: Reaction Rate (t-2)
+        # 4: Wind U
+        # 5: Wind V
+        # 6: Moisture
+        # 7: Terrain (Elevation)
         input_stack = np.stack([
             fuel_map[t],      
             rr_t,             
@@ -132,7 +150,8 @@ class FireEmulationDataset(Dataset):
             rr_tm2,           
             wx_vol,           
             wy_vol,           
-            mst_vol           
+            mst_vol,
+            terr_vol
         ], axis=0)
         
         # Target is change in SMOOTHED field

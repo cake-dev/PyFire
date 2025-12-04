@@ -14,8 +14,8 @@ from functools import partial
 import config
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_test_4"
-OUTPUT_DIR = "./visualizations_test_4"
+DATA_DIR = "./training_data_v2"
+OUTPUT_DIR = "./visualizations_v2"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DX = config.DX

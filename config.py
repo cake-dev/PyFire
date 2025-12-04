@@ -7,7 +7,7 @@ DY = 2.0  # meters (min 1 meter for stability)
 DZ = 1.0  # meters (vertical resolution can be stretched, but keeping uniform for v1)
 
 # Time
-DT = 0.2 # seconds
+DT = 1.0 # seconds
 RUN_SECONDS = 256  # Total simulation time in seconds
 TOTAL_TIME = RUN_SECONDS# * DT
 SAVE_INTERVAL = 1  # Save every N steps (can adjust higher to save space, but lose temporal res)
@@ -42,6 +42,12 @@ T_BURNOUT = 30.0 # seconds
 K_VON_KARMAN = 0.4
 # Roughness length (z0)
 Z0 = 0.1 # meters
+
+# --- SLOPE PHYSICS ---
+# Controls how much the terrain gradient pushes the fire uphill.
+# A value of 0.0 means no slope effect (only wind).
+# A value of 2.0 - 5.0 is typical to emulate "flame attachment".
+SLOPE_FACTOR = 4.0 
 
 MOD_DT = False
 JUMP_HACK = False

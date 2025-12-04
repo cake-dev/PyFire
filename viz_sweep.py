@@ -12,8 +12,8 @@ import multiprocessing as mp
 import config
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_sweep_3"
-OUTPUT_DIR = "./visualizations_sweep_3"
+DATA_DIR = "./training_data_sweep_7"
+OUTPUT_DIR = "./visualizations_sweep_7"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Global shared dictionary for workers
@@ -64,7 +64,10 @@ def load_data(run_id):
             'dt': float(data['dt']) if 'dt' in data else config.DT,
             'dx': float(data['dx']) if 'dx' in data else config.DX,
             'dy': float(data['dy']) if 'dy' in data else config.DY,
-            'run_name': str(data['run_name']) if 'run_name' in data else "unknown"
+            'run_name': str(data['run_name']) if 'run_name' in data else "unknown",
+            'slope_factor': float(data['slope_factor']) if 'slope_factor' in data else config.SLOPE_FACTOR,
+            'jump_hack': bool(data['jump_hack']) if 'jump_hack' in data else config.JUMP_HACK,
+            'mod_dt': bool(data['mod_dt']) if 'mod_dt' in data else config.MOD_DT,
         }
 
     return fuel, rr, terrain, wind_local, (w_spd, w_dir), wind_heights, sim_meta
@@ -121,7 +124,7 @@ def render_worker(frame_data):
     r_t = rr_vol[t]
     w_spd, w_dir = wind_info
 
-    fig = plt.figure(figsize=(10, 5), dpi=80)
+    fig = plt.figure(figsize=(12, 6), dpi=80)
     gs = gridspec.GridSpec(1, 2)
     
     ax1 = fig.add_subplot(gs[0, 0])
@@ -129,19 +132,21 @@ def render_worker(frame_data):
     
     # Calculate real time for title
     real_time = t * sim_meta['dt']
-    fig.suptitle(f"Run: {sim_meta['run_name']} | T={real_time:.1f}s | DT={sim_meta['dt']} DX={sim_meta['dx']}", fontsize=14)
+    fig.suptitle(f"Run: {sim_meta['run_name']} | T={real_time:.1f}s | DT={sim_meta['dt']} DX={sim_meta['dx']} | Slope={sim_meta['slope_factor']} | jump_hack={sim_meta['jump_hack']} | mod_dt={sim_meta['mod_dt']}", fontsize=14)
 
     # 1. Fire view
     ax1.set_title("Fuel & Fire")
     ax1.imshow(np.max(f_t, axis=2).T, cmap='Greens', vmin=0, vmax=2.0, origin='lower')
     ax1.imshow(np.max(r_t, axis=2).T, cmap='hot', alpha=0.6, origin='lower')
-    ax1.contour(terrain.T, colors='white', alpha=0.3)
+    ax1.contour(terrain.T, levels=8, colors='white', alpha=0.3, linewidths=0.5)
+    
 
     # 2. ROS view
     ax2.set_title("Rate of Spread (m/s)")
     mask = arrival_map > t 
     masked_ros = np.ma.masked_where(mask | (ros_map == 0), ros_map)
     im = ax2.imshow(masked_ros.T, cmap='viridis', vmin=0, vmax=5.0, origin='lower')
+    ax2.imshow(terrain.T, cmap='Greens', alpha=0.3, origin='lower', interpolation='nearest')
     plt.colorbar(im, ax=ax2)
 
     plt.tight_layout()

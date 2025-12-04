@@ -5,6 +5,7 @@ import config
 import wind_gpu
 import fire_gpu
 import gpu_utils
+import scipy.ndimage
 
 def run_simulation(params, run_id, output_dir):
     # Unpack parameters
@@ -35,12 +36,20 @@ def run_simulation(params, run_id, output_dir):
     else:
         elevation_host = np.zeros((nx, ny), dtype=np.float32)
 
+    # --- CRITICAL FIX FOR BLOCKY TERRAIN ---
+    # We create a "Physics Elevation" map. 
+    # If the world is blocky (Minecraft style), the gradient is zero on top of blocks 
+    # and infinite at the edges. This kills the "uphill acceleration" effect.
+    # We apply a Gaussian blur to create a smooth "ramp" representing the average slope.
+    # sigma=1.5 smoothes out sharp 1-block steps into a continuous slope.
+    elevation_physics = scipy.ndimage.gaussian_filter(elevation_host, sigma=1.5)
+
     z_coords_host = np.arange(nz) * dz
     wind_rad = np.radians(270 - wind_dir_deg)
     # wind_rad = np.radians(wind_dir_deg - 90)
 
     # 2. Allocate Device Memory
-    elevation_dev = cuda.to_device(elevation_host)
+    elevation_dev = cuda.to_device(elevation_physics)
     z_coords_dev = cuda.to_device(z_coords_host)
     fuel_0_dev = cuda.to_device(fuel_host)
     fuel_dev = cuda.to_device(fuel_host)
@@ -148,7 +157,8 @@ def run_simulation(params, run_id, output_dir):
             ep_counts_dev, 
             n_ep_received_dev, incoming_x_dev, incoming_y_dev, incoming_z_dev,
             centroid_x_dev, centroid_y_dev, centroid_z_dev,
-            u_dev, v_dev, w_dev, rng_states, dx, dy, dz, config.DT
+            u_dev, v_dev, w_dev, elevation_dev, 
+            rng_states, dx, dy, dz, config.DT, config.SLOPE_FACTOR, config.JUMP_HACK, config.MOD_DT
         )
 
         if t % save_interval == 0 and frame_idx < num_frames:

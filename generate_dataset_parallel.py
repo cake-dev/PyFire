@@ -12,9 +12,9 @@ import run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_test_4"
-STATS_DIR = "./training_data_new_stats"
-NUM_SAMPLES = 32
+DATA_DIR = "./training_data_v2"
+STATS_DIR = "./training_data_v2_stats"
+NUM_SAMPLES = 1024
 NUM_WORKERS = 32  # A100 has 40GB VRAM, can handle multiple sims
 
 def generate_single_sample(run_id):
@@ -34,7 +34,7 @@ def generate_single_sample(run_id):
         else:
             fuel_grid, terrain_grid = world_gen.generate_world(nx, ny, nz)
         
-        speed = np.random.uniform(10.0, 20.0)
+        speed = np.random.uniform(5.0, 20.0)
         direction = np.random.uniform(0.0, 360.0)
         # direction = np.random.choice([0.0, 90.0, 180.0, 270.0])
         moisture = np.random.uniform(0.1, 1.0)
@@ -165,8 +165,8 @@ def main():
     print(f"Average time per sample: {duration/NUM_SAMPLES:.2f}s")
     
     # # Generate Plots
-    # print("Generating distribution statistics...")
-    # plot_distributions(successful_stats, STATS_DIR)
+    print("Generating distribution statistics...")
+    plot_distributions(successful_stats, STATS_DIR)
 
 if __name__ == "__main__":
     main()

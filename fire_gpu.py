@@ -91,7 +91,7 @@ def compute_reaction_and_fuel_kernel(fuel_density, fuel_moisture,
 def transport_eps_kernel(ep_counts, 
                          n_ep_received, incoming_x, incoming_y, incoming_z,
                          centroid_x, centroid_y, centroid_z, 
-                         u, v, w, rng_states, dx, dy, dz, dt):
+                         u, v, w, elevation, rng_states, dx, dy, dz, dt, slope_factor, jump_hack, mod_dt):
     """
     Sub-grid Transport with Bifurcation (Tower/Trough) Logic
     """
@@ -109,6 +109,18 @@ def transport_eps_kernel(ep_counts,
             src_x = i + centroid_x[i, j, k] + jitter
             src_y = j + centroid_y[i, j, k] + jitter
             src_z = k + centroid_z[i, j, k] + jitter
+
+            # --- CALCULATE SLOPE VECTOR ---
+            # We calculate the gradient of the terrain at this (i, j) location
+            # and add a bias vector pointing uphill.
+            i_prev = max(0, i - 1)
+            i_next = min(nx - 1, i + 1)
+            j_prev = max(0, j - 1)
+            j_next = min(ny - 1, j + 1)
+            
+            # Local gradient (Rise over Run)
+            dz_dx = (elevation[i_next, j] - elevation[i_prev, j]) / (2.0 * dx)
+            dz_dy = (elevation[i, j_next] - elevation[i, j_prev]) / (2.0 * dy)
             
             # Split counts
             n_wind = int(count * 0.7) 
@@ -168,16 +180,20 @@ def transport_eps_kernel(ep_counts,
                     dy_travel = (vc + vp * scale)
                     dz_travel = (wc + wp * scale) # Normal turbulence
 
+                # --- APPLY SLOPE CORRECTION ---
+                # Add uphill bias to the horizontal transport
+                dx_travel += dz_dx * slope_factor
+                dy_travel += dz_dy * slope_factor
+
                 # jump_hack (optional)
-                if config.JUMP_HACK:
+                if jump_hack:
                     grid_dist_x = dx_travel / dx
                     grid_dist_y = dy_travel / dy
                     
                     # Calculate magnitude of the jump in 2D grid space
                     jump_mag = math.sqrt(grid_dist_x**2 + grid_dist_y**2)
                     
-                    # Max Jump: 1.5 cells ensures we hit neighbors or neighbors-of-neighbors
-                    # but prevents flying 5+ cells away.
+                    # Max Jump: maximum distance an EP can jump in one step
                     max_jump = 1.5 
                     
                     if jump_mag > max_jump:
@@ -192,7 +208,7 @@ def transport_eps_kernel(ep_counts,
                     dest_z_glob = src_z + (dz_travel + 2.0) / dz
                 else:
                     # Apply Transport
-                    if config.MOD_DT:
+                    if mod_dt:
                         dx_travel *= dt
                         dy_travel *= dt
                         dz_travel *= dt
@@ -223,6 +239,11 @@ def transport_eps_kernel(ep_counts,
                 
                 uc = u[i, j, k]
                 vc = v[i, j, k]
+                # Creeping also feels the slope!
+                # Bias the random walk uphill
+                uc += dz_dx * slope_factor * 2.0 # Stronger effect on creeping
+                vc += dz_dy * slope_factor * 2.0
+                
                 wind_mag = math.sqrt(uc*uc + vc*vc)
                 
                 dot = 0.0

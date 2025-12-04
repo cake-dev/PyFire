@@ -16,7 +16,7 @@ import torch.nn.functional as F
 BATCH_SIZE = 8          
 LEARNING_RATE = 2e-5    
 EPOCHS = 30             
-DATA_DIR = "./training_data_test"
+DATA_DIR = "./training_data_v2"
 CHECKPOINT_DIR = "./checkpoints_swin"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -97,8 +97,9 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True)
     
+    # Updated to 8 input channels to include Terrain
     model = SwinUNetFireEmulator(
-        in_channels=7, 
+        in_channels=8, 
         out_channels=1,
         img_size=(config.NZ, config.NX, config.NY) 
     ).to(device)
@@ -169,6 +170,4 @@ def train():
             print("--> Best model saved.")
 
 if __name__ == "__main__":
-    # supress this warning: <frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cuda module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.driver module instead.
-    
     train()
