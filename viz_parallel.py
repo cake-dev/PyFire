@@ -11,15 +11,16 @@ from tqdm import tqdm
 import scipy.ndimage
 import multiprocessing as mp
 from functools import partial
+import config
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_new_wind_2"
-OUTPUT_DIR = "./visualizations"
+DATA_DIR = "./training_data_test_4"
+OUTPUT_DIR = "./visualizations_test_4"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-DX = 2.0
-DY = 2.0
-DT = 1.0
+DX = config.DX
+DY = config.DY
+DT = config.DT
 
 # --- GLOBAL SHARED DATA (For Worker Processes) ---
 shared_data = {}
@@ -87,19 +88,14 @@ def calculate_ros_map(rr_vol):
     with np.errstate(divide='ignore'):
         ros_map = 1.0 / slowness
     
-    # --- FIXES START HERE ---
-    
-    # Fix 1: Cap infinite/high values instead of setting to 0
-    # Any spread faster than 30 m/s is likely an artifact or instant ignition
+    # Cap infinite/high values instead of setting to 0
     ros_map[ros_map > 30.0] = 30.0 
     
-    # Fix 2: Apply Kernel Smoothing to the ROS Map itself
-    # Median filter removes "salt and pepper" spikes (single hot pixels)
+    # Apply Kernel Smoothing to the ROS Map
     ros_map = scipy.ndimage.median_filter(ros_map, size=3)
-    # Gaussian filter smooths the transitions for a nicer contour look
     ros_map = scipy.ndimage.gaussian_filter(ros_map, sigma=1.0)
 
-    # Re-apply mask for unburnt areas so the smoothing didn't bleed into safe zones
+    # Re-apply mask
     ros_map[never_burnt_mask] = 0
     
     return arrival_indices, ros_map
@@ -171,10 +167,10 @@ def render_worker(frame_data):
     ax3.set_title("Instantaneous Rate of Spread (m/s)")
     mask = arrival_map > t 
     masked_ros = np.ma.masked_where(mask | (ros_map == 0), ros_map)
-    ax3.imshow(terrain.T, cmap='gray', alpha=0.3, origin='lower', interpolation='nearest')
+    ax3.imshow(terrain.T, cmap='Greens', alpha=0.3, origin='lower', interpolation='nearest')
     
-    # Changed to viridis, clipped max to 2.0 or 5.0 depending on your preference (kept 2.0 from your snippet)
-    im3 = ax3.imshow(masked_ros.T, cmap='viridis', vmin=0, vmax=3.0, origin='lower', interpolation='nearest')
+    # Smooth ROS visualization
+    im3 = ax3.imshow(masked_ros.T, cmap='viridis', vmin=0, vmax=5.0, origin='lower', interpolation='nearest')
     
     plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04).set_label('ROS (m/s)')
     ax3.set_ylabel("Y Distance")
@@ -198,8 +194,10 @@ def render_worker(frame_data):
         im4 = ax4.imshow(masked_wind.T, cmap='plasma', origin='lower', vmin=0, vmax=15.0, interpolation='nearest')
         cb_label = 'Speed (m/s)'
 
-    u_glob = np.cos(np.radians(w_dir + 180))
-    v_glob = np.sin(np.radians(w_dir + 180))
+    wind_rad = np.radians(270 - w_dir)
+    # wind_rad = np.radians(w_dir - 90)
+    u_glob = np.cos(wind_rad)
+    v_glob = np.sin(wind_rad)
     
     ax4.quiver(0.92, 0.92, u_glob, v_glob, transform=ax4.transAxes, 
                pivot='middle', scale=10, width=0.02, color='black', zorder=9)
@@ -236,20 +234,17 @@ def render_worker(frame_data):
     
     return image_rgba[:, :, :3]
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("run_id", type=int, help="ID of the run to visualize (e.g. 999)")
-    parser.add_argument("--suffix", type=str, default="", help="Optional suffix for the output file")
-    parser.add_argument("--wind_smooth", type=int, default=0, help="Kernel size for spatial smoothing (box average) of wind")
-    parser.add_argument("--history", type=str, choices=['on', 'off'], default='on', help="Enable persistent history for wind plots")
-    parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1), help="Number of render processes (default: cpu_count - 1)")
-    parser.add_argument("--height", type=float, default=5.0, help="Height level to visualize (typically 5, 10, 15)")
-    parser.add_argument("--average", type=str, default=None, help="Comma-separated list of heights to average (e.g. '5,10,15'). Overrides --height.")
-    args = parser.parse_args()
-
-    print(f"Loading run_{args.run_id}...")
-    data = load_data(args.run_id)
-    if data is None: return
+def process_single_run(run_id, args):
+    """
+    Encapsulates the entire visualization pipeline for one run ID.
+    """
+    print(f"\n--- Processing Run {run_id} ---")
+    print(f"Loading data...")
+    data = load_data(run_id)
+    if data is None: 
+        print(f"Skipping Run {run_id} (Data not found)")
+        return
+        
     fuel, rr, terrain, wind_local, wind_info, wind_heights = data
     
     print("Calculating Rate of Spread Map...")
@@ -257,25 +252,23 @@ def main():
     
     w_spd = wind_info[0]
 
-    # --- DETERMINE Z-MODE (Specific Height vs Average) ---
+    # --- DETERMINE Z-MODE ---
     selected_indices = []
     target_h_str = ""
     file_tag = ""
     
     if args.average:
-        # Parse comma-separated list
         try:
             req_heights = [float(h.strip()) for h in args.average.split(',')]
             valid_heights = []
             for h in req_heights:
-                # Find closest index for each requested height
                 diffs = np.abs(wind_heights - h)
-                if np.min(diffs) < 1.0: # 1 meter tolerance
+                if np.min(diffs) < 1.0: 
                     idx = np.argmin(diffs)
                     selected_indices.append(idx)
                     valid_heights.append(wind_heights[idx])
             
-            selected_indices = sorted(list(set(selected_indices))) # Remove duplicates/sort
+            selected_indices = sorted(list(set(selected_indices))) 
             
             if not selected_indices:
                 print(f"Error: None of the requested heights {req_heights} matched available data {wind_heights}.")
@@ -286,11 +279,10 @@ def main():
             file_tag = "avg_" + "_".join([str(int(h)) for h in valid_heights])
             
         except ValueError:
-            print("Error: --average format must be comma-separated numbers (e.g., '5,10,15')")
+            print("Error: --average format must be comma-separated numbers")
             return
             
     elif wind_local is not None:
-        # Default single layer behavior
         diffs = np.abs(wind_heights - args.height)
         if np.min(diffs) < 1.0: 
             height_idx = np.argmin(diffs)
@@ -299,7 +291,7 @@ def main():
             target_h_str = f"{wind_heights[height_idx]}m"
             file_tag = f"z{int(wind_heights[height_idx])}"
         else:
-            print(f"WARNING: Requested height {args.height}m not found in {wind_heights}. Defaulting to {wind_heights[0]}m.")
+            print(f"WARNING: Requested height {args.height}m not found. Defaulting to {wind_heights[0]}m.")
             selected_indices = [0]
             target_h_str = f"{wind_heights[0]}m"
             file_tag = f"z{int(wind_heights[0])}"
@@ -313,11 +305,9 @@ def main():
     max_h_dist_history = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
     max_w_history = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
     
-    # Establish Baseline Flow (Frame 0)
     if wind_local is not None:
-        # Select layers and average
         base_subset = wind_local[0][selected_indices]
-        base_frame = np.mean(base_subset, axis=0) # Shape (3, NX, NY)
+        base_frame = np.mean(base_subset, axis=0)
         u_base = base_frame[0]
         v_base = base_frame[1]
     else:
@@ -337,7 +327,6 @@ def main():
         current_mag = np.zeros_like(u_grid)
 
         if wind_local is not None:
-            # Slice and Average
             current_subset = wind_local[t][selected_indices]
             avg_frame = np.mean(current_subset, axis=0)
             
@@ -350,17 +339,14 @@ def main():
                 v_grid = scipy.ndimage.uniform_filter(v_grid, size=args.wind_smooth)
                 w_grid = scipy.ndimage.uniform_filter(w_grid, size=args.wind_smooth)
             
-            # 1. Update Horizontal History (Disturbance from Baseline)
             diff_u = u_grid - u_base
             diff_v = v_grid - v_base
             current_disturbance = np.sqrt(diff_u**2 + diff_v**2)
             np.maximum(max_h_dist_history, current_disturbance, out=max_h_dist_history)
 
-            # 2. Update Vertical History
             update_mask_w = np.abs(w_grid) > np.abs(max_w_history)
             max_w_history[update_mask_w] = w_grid[update_mask_w]
             
-            # 3. Calculate Mag for Instant mode
             current_mag = np.sqrt(u_grid**2 + v_grid**2)
 
         if is_history:
@@ -383,10 +369,10 @@ def main():
         }
         render_tasks.append(task_data)
 
-    # --- PHASE 2: PARALLEL RENDERING ---
     print(f"Rendering {len(render_tasks)} frames on {args.workers} CPUs...")
     
     frames = []
+    # Re-initialize pool for each run to keep memory clean
     with mp.Pool(processes=args.workers, 
                  initializer=init_worker, 
                  initargs=(fuel, rr, terrain, ros_map, arrival_indices)) as pool:
@@ -395,12 +381,49 @@ def main():
             frames.append(frame)
 
     suffix_str = args.suffix if args.suffix else ""
-    output_filename = f"run_{args.run_id}_viz_{args.history}_{file_tag}_{suffix_str}.mp4"
+    output_filename = f"run_{run_id}_viz_{args.history}_{file_tag}_{suffix_str}.mp4"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
         
     print(f"Saving video to {output_path}...")
     iio.imwrite(output_path, np.stack(frames), fps=10)
-    print("Done!")
+    print(f"Run {run_id} Complete!")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("run_id", type=str, help="ID of the run(s). Can be single '999', list '1,2,3', or range '1-5'")
+    parser.add_argument("--suffix", type=str, default="", help="Optional suffix for the output file")
+    parser.add_argument("--wind_smooth", type=int, default=0, help="Kernel size for spatial smoothing (box average) of wind")
+    parser.add_argument("--history", type=str, choices=['on', 'off'], default='on', help="Enable persistent history for wind plots")
+    parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1), help="Number of render processes")
+    parser.add_argument("--height", type=float, default=5.0, help="Height level to visualize (typically 5, 10, 15)")
+    parser.add_argument("--average", type=str, default=None, help="Comma-separated list of heights to average")
+    # Added explicit --runs arg as requested, though positional 'run_id' handles it too. 
+    # To keep interface clean, I'll parse the main positional arg 'run_id' to support lists/ranges.
+    args = parser.parse_args()
+
+    # Parse Run IDs
+    run_ids = []
+    try:
+        if '-' in args.run_id:
+            start, end = map(int, args.run_id.split('-'))
+            run_ids = list(range(start, end + 1))
+        elif ',' in args.run_id:
+            run_ids = [int(x) for x in args.run_id.split(',')]
+        else:
+            run_ids = [int(args.run_id)]
+    except ValueError:
+        print("Error: Invalid run ID format. Use '1', '1,2,3', or '1-5'.")
+        return
+
+    print(f"Batch processing {len(run_ids)} runs: {run_ids}")
+
+    for rid in run_ids:
+        try:
+            process_single_run(rid, args)
+        except Exception as e:
+            print(f"CRITICAL ERROR processing Run {rid}: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main()

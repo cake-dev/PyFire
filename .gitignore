@@ -2,4 +2,4 @@ training_*/
 __pycache__/
 checkpoints*/
 emu_models*/
-visualizations/
+visualizations*/

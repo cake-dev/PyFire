@@ -37,6 +37,7 @@ def run_simulation(params, run_id, output_dir):
 
     z_coords_host = np.arange(nz) * dz
     wind_rad = np.radians(270 - wind_dir_deg)
+    # wind_rad = np.radians(wind_dir_deg - 90)
 
     # 2. Allocate Device Memory
     elevation_dev = cuda.to_device(elevation_host)
@@ -147,7 +148,7 @@ def run_simulation(params, run_id, output_dir):
             ep_counts_dev, 
             n_ep_received_dev, incoming_x_dev, incoming_y_dev, incoming_z_dev,
             centroid_x_dev, centroid_y_dev, centroid_z_dev,
-            u_dev, v_dev, w_dev, rng_states, dx, dy, dz
+            u_dev, v_dev, w_dev, rng_states, dx, dy, dz, config.DT
         )
 
         if t % save_interval == 0 and frame_idx < num_frames:

@@ -12,10 +12,10 @@ import run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_new_wind_2"
+DATA_DIR = "./training_data_test_4"
 STATS_DIR = "./training_data_new_stats"
 NUM_SAMPLES = 32
-NUM_WORKERS = 4  # A100 has 40GB VRAM, can handle multiple sims
+NUM_WORKERS = 32  # A100 has 40GB VRAM, can handle multiple sims
 
 def generate_single_sample(run_id):
     """
@@ -25,16 +25,25 @@ def generate_single_sample(run_id):
     try:
         # 1. Generate Params (CPU Heavy)
         nx, ny, nz = config.NX, config.NY, config.NZ
-        fuel_grid, terrain_grid = world_gen.generate_world(nx, ny, nz)
+        world_path = "world_data.npz"
+        load_world = False
+        if load_world and os.path.exists(world_path):
+            data = np.load(world_path)
+            fuel_grid = data['fuel']
+            terrain_grid = data['terrain_z']
+        else:
+            fuel_grid, terrain_grid = world_gen.generate_world(nx, ny, nz)
         
-        speed = np.random.uniform(1.0, 25.0)
+        speed = np.random.uniform(10.0, 20.0)
         direction = np.random.uniform(0.0, 360.0)
-        moisture = np.random.uniform(0.1, 1.5)
+        # direction = np.random.choice([0.0, 90.0, 180.0, 270.0])
+        moisture = np.random.uniform(0.1, 1.0)
+        # moisture = np.random.choice([0.1, 0.5, 1.0, 100])
 
         # defaults
-        # speed = 4.0
-        # direction = 90.0
-        # moisture = 0.2
+        # speed = 20.0
+        # direction = 180.0
+        # moisture = 0.5
         
         # Smart Ignition Logic
         ig_x, ig_y, ig_z = 0, 0, 0
@@ -48,7 +57,11 @@ def generate_single_sample(run_id):
         else:
             ig_x, ig_y = nx // 2, ny // 2
             ig_z = int(terrain_grid[ig_x, ig_y])
-        ig_x, ig_y = nx // 2, ny // 2
+        # ig_x, ig_y = nx // 2, ny // 2
+        # ig_z = int(terrain_grid[ig_x, ig_y])
+        # randomly place within central 50%
+        ig_x = np.random.randint(nx * 0.25, nx * 0.75)
+        ig_y = np.random.randint(ny * 0.25, ny * 0.75)
         ig_z = int(terrain_grid[ig_x, ig_y])
         params = {
             'wind_speed': speed,

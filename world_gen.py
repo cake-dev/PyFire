@@ -1,87 +1,104 @@
 import numpy as np
-try:
-    from opensimplex import OpenSimplex
-except ImportError:
-    print("Please install opensimplex: pip install opensimplex")
-    raise
+import math
+from numba import cuda, njit, prange
+import os
 
-def generate_noise_2d(shape, scale=50.0, octaves=3, persistence=0.5, lacunarity=2.0, seed=None):
+# --- GPU NOISE KERNELS ---
+
+@cuda.jit(device=True)
+def hash12(x, y, seed):
     """
-    Python implementation of your JS generateProceduralTerrain FBM logic.
+    GLSL-style hash function for pseudo-random numbers on GPU.
+    Returns float between 0.0 and 1.0
     """
-    nx, ny = shape
-    if seed is None:
-        seed = np.random.randint(0, 10000)
+    val = math.sin(x * 12.9898 + y * 78.233 + seed) * 43758.5453
+    return val - math.floor(val)
+
+@cuda.jit(device=True)
+def mix(a, b, t):
+    return a * (1.0 - t) + b * t
+
+@cuda.jit(device=True)
+def smoothstep(t):
+    return t * t * (3.0 - 2.0 * t)
+
+@cuda.jit(device=True)
+def noise_2d_gpu(x, y, seed):
+    """
+    Value Noise implementation on GPU.
+    """
+    ix = math.floor(x)
+    iy = math.floor(y)
+    fx = x - ix
+    fy = y - iy
+
+    # Four corners
+    a = hash12(ix, iy, seed)
+    b = hash12(ix + 1.0, iy, seed)
+    c = hash12(ix, iy + 1.0, seed)
+    d = hash12(ix + 1.0, iy + 1.0, seed)
+
+    # Smooth interpolation
+    ux = smoothstep(fx)
+    uy = smoothstep(fy)
+
+    # Mix
+    return mix(mix(a, b, ux), mix(c, d, ux), uy)
+
+@cuda.jit
+def generate_terrain_kernel(terrain, nx, ny, scale, octaves, persistence, lacunarity, seed):
+    """
+    Generates FBM terrain directly on GPU.
+    """
+    x, y = cuda.grid(2)
     
-    # Initialize OpenSimplex with seed
-    gen = OpenSimplex(seed)
-    
-    terrain = np.zeros((nx, ny), dtype=np.float32)
-    
-    # We want to iterate coordinates. 
-    # Optimization: Use meshgrid to vectorize if possible, but loops are clearer for matching JS.
-    max_val = 0
-    
-    for i in range(octaves):
-        amplitude = persistence ** i
-        frequency = lacunarity ** i
-        max_val += amplitude
+    if x < nx and y < ny:
+        amplitude = 1.0
+        frequency = 1.0
+        max_val = 0.0
+        total = 0.0
         
-        # Generate noise for the whole grid at this frequency/amplitude
-        # Using a loop here to mimic the JS structure exactly, but 
-        # in production you might use vectorized noise calls.
-        for x in range(nx):
-            for y in range(ny):
-                # Offset with seed logic similar to JS
-                # Note: OpenSimplex handles seeding internally, but we can offset coords too
-                # to strictly match the "shifting" logic if desired.
-                sample_x = (x + seed) / scale * frequency
-                sample_y = (y + seed) / scale * frequency
-                
-                # noise2d returns -1 to 1. Map to 0 to 1
-                val = (gen.noise2(sample_x, sample_y) + 1) / 2
-                terrain[x, y] += val * amplitude
+        # FBM Loop
+        for i in range(octaves):
+            sx = (x + seed) / scale * frequency
+            sy = (y + seed) / scale * frequency
+            
+            val = noise_2d_gpu(sx, sy, seed)
+            total += val * amplitude
+            max_val += amplitude
+            
+            amplitude *= persistence
+            frequency *= lacunarity
+            
+        # Normalize and Curve
+        if max_val > 0:
+            norm = total / max_val
+            terrain[x, y] = norm ** 1.5
 
-    # Normalize
-    terrain = terrain / max_val
-    
-    # Apply non-linear curve (Math.pow(elevation, 1.5))
-    terrain = np.power(terrain, 1.5)
-    
-    return terrain
+# --- CPU HELPERS (Trees) ---
 
-def generate_world(nx, ny, nz, scale=60.0, max_height=12.0):
+@njit(parallel=True)
+def place_trees_cpu(fuel, terrain_z, nx, ny, nz, num_trees, seed):
     """
-    Generates terrain matching the JS visualizer and places fuel on top.
+    Places trees on the CPU using Numba for speed.
+    Parallelized with prange to handle large grid sizes (512+) efficiently.
     """
-    # 1. Generate Terrain Heightmap
-    # Note: scale is 'zoomed out' factor. Higher = smoother.
-    norm_terrain = generate_noise_2d((nx, ny), scale=scale, seed=np.random.randint(0, 1000))
+    np.random.seed(seed)
     
-    # Scale to actual height (Z-indices)
-    terrain_z = (norm_terrain * max_height).astype(np.int32)
-    # Clamp to ensure we don't exceed grid
-    terrain_z = np.clip(terrain_z, 0, nz - 1)
-    
-    # 2. Generate Fuel (3D)
-    fuel = np.zeros((nz, nx, ny), dtype=np.float32)
-    
-    # A. Surface Fuel (Grass) - Placed exactly at the terrain level
-    for x in range(nx):
-        for y in range(ny):
-            z_ground = terrain_z[x, y]
-            if z_ground < nz:
-                fuel[z_ground, x, y] = np.random.uniform(0.5, 0.8) # Grass density
-
-    # B. Tree Generation (Adjusted for Terrain Height)
-    num_trees = np.random.randint(20, 50)
-    
-    for _ in range(num_trees):
-        tx, ty = np.random.randint(0, nx), np.random.randint(0, ny)
+    # We loop over trees in parallel. 
+    # Since write operations (assignments) to fuel are simple overrides, 
+    # race conditions (two trees overlapping) are benign for generation.
+    for i in prange(num_trees):
+        # Re-seeding per thread or just using global random state in Numba
+        # Numba handles thread-local RNG automatically in parallel loops
+        
+        tx = np.random.randint(0, nx)
+        ty = np.random.randint(0, ny)
         z_base = terrain_z[tx, ty]
         
-        # Don't place trees if ground is too high
-        if z_base >= nz - 5: continue
+        # Don't place trees if ground is too high or out of bounds
+        if z_base >= nz - 5: 
+            continue
             
         tree_height = np.random.randint(8, 15)
         crown_base = np.random.randint(3, 6)
@@ -90,18 +107,89 @@ def generate_world(nx, ny, nz, scale=60.0, max_height=12.0):
         top = min(z_base + tree_height, nz - 1)
         trunk_top = min(z_base + crown_base, top)
         
-        # Trunk
-        fuel[z_base:trunk_top, tx, ty] = 2.0
+        # 1. Trunk
+        if trunk_top > z_base:
+            for z in range(z_base, trunk_top):
+                fuel[z, tx, ty] = 2.0
         
-        # Crown
+        # 2. Crown
         center_z = (trunk_top + top) / 2
-        for z in range(trunk_top, top):
-            for dx in range(-crown_radius, crown_radius+1):
-                for dy in range(-crown_radius, crown_radius+1):
+        
+        z_start = trunk_top
+        z_end = top
+        
+        for z in range(z_start, z_end):
+            for dx in range(-crown_radius, crown_radius + 1):
+                for dy in range(-crown_radius, crown_radius + 1):
                     dist_sq = dx*dx + dy*dy + (z - center_z)**2
                     if dist_sq < crown_radius**2:
-                        cx, cy = tx + dx, ty + dy
+                        cx = tx + dx
+                        cy = ty + dy
+                        
                         if 0 <= cx < nx and 0 <= cy < ny:
-                            fuel[z, cx, cy] = np.random.uniform(0.8, 1.2)
+                            fuel[z, cx, cy] = 0.8 + (np.random.random() * 0.4)
+
+def generate_world(nx, ny, nz, scale=60.0, max_height=12.0):
+    """
+    Generates terrain and fuel. 
+    """
+    seed = np.random.randint(0, 10000)
+    
+    # 1. Generate Terrain (GPU)
+    # -------------------------
+    threadsperblock = (8, 8)
+    blockspergrid_x = (nx + threadsperblock[0] - 1) // threadsperblock[0]
+    blockspergrid_y = (ny + threadsperblock[1] - 1) // threadsperblock[1]
+    blockspergrid = (blockspergrid_x, blockspergrid_y)
+    
+    terrain_dev = cuda.device_array((nx, ny), dtype=np.float32)
+    
+    generate_terrain_kernel[blockspergrid, threadsperblock](
+        terrain_dev, nx, ny, scale, 3, 0.5, 2.0, float(seed)
+    )
+    
+    norm_terrain = terrain_dev.copy_to_host()
+    del terrain_dev
+    
+    # Scale to integer height
+    terrain_z = (norm_terrain * max_height).astype(np.int32)
+    terrain_z = np.clip(terrain_z, 0, nz - 1)
+    
+    # 2. Generate Fuel (CPU - Vectorized)
+    # -----------------------------------
+    fuel = np.zeros((nz, nx, ny), dtype=np.float32)
+    
+    # A. Surface Fuel (Grass) - Vectorized
+    # Generate random grass density field
+    grass_density = np.random.uniform(0.5, 0.8, (nx, ny)).astype(np.float32)
+    
+    # Create coordinate meshes
+    X, Y = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
+    
+    # Identify valid locations where ground is within bounds
+    valid_mask = terrain_z < nz
+    
+    # Extract flattened coordinates using boolean masking
+    z_indices = terrain_z[valid_mask]
+    x_indices = X[valid_mask]
+    y_indices = Y[valid_mask]
+    densities = grass_density[valid_mask]
+    
+    # Bulk assignment
+    fuel[z_indices, x_indices, y_indices] = densities
+
+    # B. Tree Generation (Numba CPU Parallel)
+    # ---------------------------------------
+    base_density = 35 / (128 * 128) 
+    total_cells = nx * ny
+    calc_num_trees = int(total_cells * base_density)
+    num_trees = max(20, calc_num_trees)
+    
+    place_trees_cpu(fuel, terrain_z, nx, ny, nz, num_trees, seed)
+
+    # optional: save the world to file to be loaded later, if there is not one saved already
+
+    if not os.path.exists("world_data.npz") and False:
+        np.savez_compressed("world_data.npz", fuel=fuel, terrain_z=terrain_z)
 
     return fuel, terrain_z.astype(np.float32)
