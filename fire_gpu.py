@@ -1,6 +1,7 @@
 import math
 from numba import cuda
 from numba.cuda.random import xoroshiro128p_normal_float32, xoroshiro128p_uniform_float32
+import config
 
 @cuda.jit
 def compute_reaction_and_fuel_kernel(fuel_density, fuel_moisture, 
@@ -167,10 +168,37 @@ def transport_eps_kernel(ep_counts,
                     dy_travel = (vc + vp * scale)
                     dz_travel = (wc + wp * scale) # Normal turbulence
 
-                # Apply Transport
-                dest_x_glob = src_x + dx_travel / dx
-                dest_y_glob = src_y + dy_travel / dy
-                dest_z_glob = src_z + (dz_travel + 2.0) / dz # +2.0 base buoyancy
+                # jump_hack (optional)
+                if config.JUMP_HACK:
+                    grid_dist_x = dx_travel / dx
+                    grid_dist_y = dy_travel / dy
+                    
+                    # Calculate magnitude of the jump in 2D grid space
+                    jump_mag = math.sqrt(grid_dist_x**2 + grid_dist_y**2)
+                    
+                    # Max Jump: 1.5 cells ensures we hit neighbors or neighbors-of-neighbors
+                    # but prevents flying 5+ cells away.
+                    max_jump = 1.5 
+                    
+                    if jump_mag > max_jump:
+                        factor = max_jump / jump_mag
+                        grid_dist_x *= factor
+                        grid_dist_y *= factor
+                        # Note: We usually don't clamp Z as strictly to allow crowning
+                    
+                    # Apply the clamped transport
+                    dest_x_glob = src_x + grid_dist_x
+                    dest_y_glob = src_y + grid_dist_y
+                    dest_z_glob = src_z + (dz_travel + 2.0) / dz
+                else:
+                    # Apply Transport
+                    if config.MOD_DT:
+                        dx_travel *= dt
+                        dy_travel *= dt
+                        dz_travel *= dt
+                    dest_x_glob = src_x + dx_travel / dx
+                    dest_y_glob = src_y + dy_travel / dy
+                    dest_z_glob = src_z + (dz_travel + 2.0) / dz # +2.0 base buoyancy
                 
                 # Destination update (Sub-grid logic)
                 di = int(math.floor(dest_x_glob))
