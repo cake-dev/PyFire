@@ -1,6 +1,6 @@
 # Grid Dimensions
-NX = 128
-NY = 128
+NX = 512
+NY = 512
 NZ = 32
 DX = 2.0  # meters (min 1 meter for stability)
 DY = 2.0  # meters (min 1 meter for stability)
@@ -8,7 +8,7 @@ DZ = 1.0  # meters (vertical resolution can be stretched, but keeping uniform fo
 
 # Time
 DT = 1.0 # seconds
-RUN_SECONDS = 256  # Total simulation time in seconds
+RUN_SECONDS = 1024  # Total simulation time in seconds
 TOTAL_TIME = RUN_SECONDS# * DT
 SAVE_INTERVAL = 1  # Save every N steps (can adjust higher to save space, but lose temporal res)
 

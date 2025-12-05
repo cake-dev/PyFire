@@ -34,15 +34,15 @@ MAX_HEIGHT = 50.0
 MODEL_REGISTRY = {
     "Standard UNet": {
         "class": UNetFireEmulator3D,
-        "dir": "checkpoints_resnet",
+        "dir": "checkpoints",
         "kwargs": {"in_channels": 8, "out_channels": 1},
-        "type": "log_space" # CHANGED from "standard" to "log_space"
+        "type": "standard_linear" 
     },
     "Swin Transformer": {
         "class": SwinUNetFireEmulator,
         "dir": "checkpoints_swin",
         "kwargs": {"in_channels": 8, "out_channels": 1, "img_size": (config.NZ, config.NX, config.NY)},
-        "type": "log_space"
+        "type": "residual_log" # Updated Type
     }
 }
 
@@ -262,7 +262,6 @@ if st.session_state['generated_data']:
         nz, nx, ny = curr_rr_np.shape
         t_mst = torch.full((1, nz, nx, ny), p['moisture'], device=device).float()
         
-        # Terrain
         t_terrain = torch.from_numpy(data['terrain']).float().to(device) / MAX_HEIGHT
         t_terrain = t_terrain.unsqueeze(0).unsqueeze(0).expand(1, nz, -1, -1)
 
@@ -303,21 +302,31 @@ if st.session_state['generated_data']:
                 ], dim=0).unsqueeze(0)
                 
                 model_inputs = inputs.clone()
-                model_type = MODEL_REGISTRY[model_choice].get("type", "log_space")
+                model_type = MODEL_REGISTRY[model_choice].get("type", "residual_log")
                 
-                # --- LOG SPACE HANDLING (For both models now) ---
-                if model_type == "log_space":
+                # --- INPUT TRANSFORM ---
+                if model_type == "residual_log":
                     model_inputs[:, 1] = torch.log1p(model_inputs[:, 1])
                     model_inputs[:, 2] = torch.log1p(model_inputs[:, 2]) 
                     model_inputs[:, 3] = torch.log1p(model_inputs[:, 3])
+                elif model_type == "standard_linear":
+                    model_inputs[:, 1] /= RR_SCALE
+                    model_inputs[:, 2] /= RR_SCALE
+                    model_inputs[:, 3] /= RR_SCALE
                 
+                # --- INFERENCE ---
                 pred = model(model_inputs).squeeze(1)
                 
-                if model_type == "log_space":
-                    # Model predicts Log(RR_next). Unwrap to Linear RR.
-                    next_rr = torch.expm1(pred)
+                # --- STATE UPDATE (The Fix) ---
+                if model_type == "residual_log":
+                    # Pred is DELTA LOG. 
+                    # log_next = log_curr + delta
+                    # next = expm1(log_next)
+                    log_curr = model_inputs[:, 1] # Already logged above
+                    log_next = log_curr + pred
+                    next_rr = torch.expm1(log_next)
                 else:
-                    # Legacy linear prediction
+                    # Pred is Linear Delta (scaled 0-1)
                     next_rr = rr_t + (pred * RR_SCALE)
                 
                 next_rr[next_rr < 5.0] = 0.0

@@ -91,7 +91,7 @@ def compute_reaction_and_fuel_kernel(fuel_density, fuel_moisture,
 def transport_eps_kernel(ep_counts, 
                          n_ep_received, incoming_x, incoming_y, incoming_z,
                          centroid_x, centroid_y, centroid_z, 
-                         u, v, w, elevation, rng_states, dx, dy, dz, dt, slope_factor, jump_hack, mod_dt):
+                         u, v, w, elevation, rng_states, dx, dy, dz, dt, slope_factor, jump_hack=False, mod_dt=False):
     """
     Sub-grid Transport with Bifurcation (Tower/Trough) Logic
     """

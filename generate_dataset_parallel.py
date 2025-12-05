@@ -12,10 +12,10 @@ import run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_v2"
+DATA_DIR = "./training_data_big"
 STATS_DIR = "./training_data_v2_stats"
-NUM_SAMPLES = 1024
-NUM_WORKERS = 32  # A100 has 40GB VRAM, can handle multiple sims
+NUM_SAMPLES = 4
+NUM_WORKERS = 4  # A100 has 40GB VRAM, can handle multiple sims
 
 def generate_single_sample(run_id):
     """
@@ -34,7 +34,7 @@ def generate_single_sample(run_id):
         else:
             fuel_grid, terrain_grid = world_gen.generate_world(nx, ny, nz)
         
-        speed = np.random.uniform(5.0, 20.0)
+        speed = np.random.uniform(10.0, 20.0)
         direction = np.random.uniform(0.0, 360.0)
         # direction = np.random.choice([0.0, 90.0, 180.0, 270.0])
         moisture = np.random.uniform(0.1, 1.0)
@@ -46,23 +46,23 @@ def generate_single_sample(run_id):
         # moisture = 0.5
         
         # Smart Ignition Logic
-        ig_x, ig_y, ig_z = 0, 0, 0
-        for _ in range(20):
-            rx = np.random.randint(nx * 0.1, nx * 0.9)
-            ry = np.random.randint(ny * 0.1, ny * 0.9)
-            ground_z = int(terrain_grid[rx, ry])
-            if ground_z < nz and fuel_grid[ground_z, rx, ry] > 0:
-                ig_x, ig_y, ig_z = rx, ry, ground_z
-                break
-        else:
-            ig_x, ig_y = nx // 2, ny // 2
-            ig_z = int(terrain_grid[ig_x, ig_y])
-        # ig_x, ig_y = nx // 2, ny // 2
-        # ig_z = int(terrain_grid[ig_x, ig_y])
-        # randomly place within central 50%
-        ig_x = np.random.randint(nx * 0.25, nx * 0.75)
-        ig_y = np.random.randint(ny * 0.25, ny * 0.75)
+        # ig_x, ig_y, ig_z = 0, 0, 0
+        # for _ in range(20):
+        #     rx = np.random.randint(nx * 0.1, nx * 0.9)
+        #     ry = np.random.randint(ny * 0.1, ny * 0.9)
+        #     ground_z = int(terrain_grid[rx, ry])
+        #     if ground_z < nz and fuel_grid[ground_z, rx, ry] > 0:
+        #         ig_x, ig_y, ig_z = rx, ry, ground_z
+        #         break
+        # else:
+        #     ig_x, ig_y = nx // 2, ny // 2
+        #     ig_z = int(terrain_grid[ig_x, ig_y])
+        ig_x, ig_y = nx // 2, ny // 2
         ig_z = int(terrain_grid[ig_x, ig_y])
+        # randomly place within central 50%
+        # ig_x = np.random.randint(nx * 0.25, nx * 0.75)
+        # ig_y = np.random.randint(ny * 0.25, ny * 0.75)
+        # ig_z = int(terrain_grid[ig_x, ig_y])
         params = {
             'wind_speed': speed,
             'wind_dir': direction,

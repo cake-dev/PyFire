@@ -89,7 +89,14 @@ def run_simulation(params, run_id, output_dir):
             temp_ep[ix, iy, iz] = 5000
     n_ep_received_dev = cuda.to_device(temp_ep)
 
-    rng_states = gpu_utils.init_rng(nx * ny * nz, seed=run_id)
+    if isinstance(run_id, str):
+        # Use hash() to generate a deterministic integer from the string
+        # abs() ensures it's positive, though numpy/numba handles unsigned usually
+        numeric_seed = abs(hash(run_id)) % (2**32) 
+    else:
+        numeric_seed = int(run_id)
+
+    rng_states = gpu_utils.init_rng(nx * ny * nz, seed=numeric_seed)
 
     # --- Setup Wind Recording (5m, 10m, 15m) ---
     target_heights = [5.0, 10.0, 15.0]
