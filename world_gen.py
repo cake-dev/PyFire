@@ -129,67 +129,59 @@ def place_trees_cpu(fuel, terrain_z, nx, ny, nz, num_trees, seed):
                         if 0 <= cx < nx and 0 <= cy < ny:
                             fuel[z, cx, cy] = 0.8 + (np.random.random() * 0.4)
 
-def generate_world(nx, ny, nz, scale=60.0, max_height=12.0):
+def generate_world(nx, ny, nz, scale=60.0, max_height=12.0, flat=False):
     """
-    Generates terrain and fuel. 
+    Generates terrain and fuel.
     """
+
     seed = np.random.randint(0, 10000)
-    
-    # 1. Generate Terrain (GPU)
-    # -------------------------
-    threadsperblock = (8, 8)
-    blockspergrid_x = (nx + threadsperblock[0] - 1) // threadsperblock[0]
-    blockspergrid_y = (ny + threadsperblock[1] - 1) // threadsperblock[1]
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    
-    terrain_dev = cuda.device_array((nx, ny), dtype=np.float32)
-    
-    generate_terrain_kernel[blockspergrid, threadsperblock](
-        terrain_dev, nx, ny, scale, 3, 0.5, 2.0, float(seed)
-    )
-    
-    norm_terrain = terrain_dev.copy_to_host()
-    del terrain_dev
-    
-    # Scale to integer height
-    terrain_z = (norm_terrain * max_height).astype(np.int32)
-    terrain_z = np.clip(terrain_z, 0, nz - 1)
-    
-    # 2. Generate Fuel (CPU - Vectorized)
-    # -----------------------------------
+
+    # 1. Terrain
+    # ----------
+    if flat:
+        # Fully flat ground at z = 0
+        terrain_z = np.zeros((nx, ny), dtype=np.int32)
+
+    else:
+        threadsperblock = (8, 8)
+        blockspergrid_x = (nx + threadsperblock[0] - 1) // threadsperblock[0]
+        blockspergrid_y = (ny + threadsperblock[1] - 1) // threadsperblock[1]
+        blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+        terrain_dev = cuda.device_array((nx, ny), dtype=np.float32)
+
+        generate_terrain_kernel[blockspergrid, threadsperblock](
+            terrain_dev, nx, ny, scale, 3, 0.5, 2.0, float(seed)
+        )
+
+        norm_terrain = terrain_dev.copy_to_host()
+        del terrain_dev
+
+        terrain_z = (norm_terrain * max_height).astype(np.int32)
+        terrain_z = np.clip(terrain_z, 0, nz - 1)
+
+    # 2. Fuel
+    # -------
     fuel = np.zeros((nz, nx, ny), dtype=np.float32)
-    
-    # A. Surface Fuel (Grass) - Vectorized
-    # Generate random grass density field
+
     grass_density = np.random.uniform(0.5, 0.8, (nx, ny)).astype(np.float32)
-    
-    # Create coordinate meshes
     X, Y = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
-    
-    # Identify valid locations where ground is within bounds
+
     valid_mask = terrain_z < nz
-    
-    # Extract flattened coordinates using boolean masking
     z_indices = terrain_z[valid_mask]
     x_indices = X[valid_mask]
     y_indices = Y[valid_mask]
     densities = grass_density[valid_mask]
-    
-    # Bulk assignment
+
     fuel[z_indices, x_indices, y_indices] = densities
 
-    # B. Tree Generation (Numba CPU Parallel)
-    # ---------------------------------------
-    base_density = 35 / (128 * 128) 
+    # 3. Trees
+    # --------
+    base_density = 35 / (128 * 128)
     total_cells = nx * ny
     calc_num_trees = int(total_cells * base_density)
     num_trees = max(20, calc_num_trees)
-    
+
     place_trees_cpu(fuel, terrain_z, nx, ny, nz, num_trees, seed)
-
-    # optional: save the world to file to be loaded later, if there is not one saved already
-
-    if not os.path.exists("world_data.npz") and False:
-        np.savez_compressed("world_data.npz", fuel=fuel, terrain_z=terrain_z)
 
     return fuel, terrain_z.astype(np.float32)

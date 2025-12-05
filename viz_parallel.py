@@ -14,13 +14,21 @@ from functools import partial
 import config
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_big"
-OUTPUT_DIR = "./visualizations_big"
+DATA_DIR = "./training_data_new"
+OUTPUT_DIR = "./visualizations_new"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DX = config.DX
 DY = config.DY
 DT = config.DT
+DZ = config.DZ
+
+# Physics Constants for Flame Length Calc
+H_WOOD = config.H_WOOD
+CP_WOOD = config.CP_WOOD
+T_CRIT = config.T_CRIT
+T_AMBIENT = config.T_AMBIENT
+EFFECTIVE_H = H_WOOD - CP_WOOD * (T_CRIT - T_AMBIENT)
 
 # --- GLOBAL SHARED DATA (For Worker Processes) ---
 shared_data = {}
@@ -88,7 +96,7 @@ def calculate_ros_map(rr_vol):
     with np.errstate(divide='ignore'):
         ros_map = 1.0 / slowness
     
-    # Cap infinite/high values instead of setting to 0
+    # Cap infinite/high values
     ros_map[ros_map > 30.0] = 30.0 
     
     # Apply Kernel Smoothing to the ROS Map
@@ -105,15 +113,10 @@ def render_worker(frame_data):
     Worker function to render a single frame.
     """
     t = frame_data['t']
-    u_grid = frame_data['u']
-    v_grid = frame_data['v']
-    h_data = frame_data['h_data']
     v_data = frame_data['v_data']
     wind_info = frame_data['wind_info']
-    h_title = frame_data['h_title']
     v_title = frame_data['v_title']
-    is_history_mode = frame_data['is_history_mode']
-
+    
     # Access shared heavy data
     fuel_vol = shared_data['fuel']
     fuel_0 = shared_data['initial_fuel']
@@ -124,7 +127,7 @@ def render_worker(frame_data):
 
     # --- RENDER LOGIC ---
     f_t = fuel_vol[t]
-    r_t = rr_vol[t]
+    r_t = rr_vol[t].astype(np.float32) # Fix: Cast to float32 to prevent overflow during Intensity calc
     
     top_fuel = np.max(f_t, axis=2) 
     top_fire = np.max(r_t, axis=2)
@@ -135,6 +138,24 @@ def render_worker(frame_data):
     fuel_loss = np.sum(fuel_0, axis=2) - np.sum(f_t, axis=2)
     burn_scar_mask = np.ma.masked_where(fuel_loss < 0.1, fuel_loss)
     
+    # --- FLAME LENGTH CALCULATION ---
+    # 1. Integrate Reaction Rate (kg/m3/s) vertically to get column sum
+    # 2. Convert to Heat Release Rate (Watts/m2)
+    #    Intensity = Sum(rr * dz) * Effective_Heat
+    # Note: rr is density change per second.
+    column_rr_sum = np.sum(r_t, axis=2) # Sum over Z
+    intensity_map = column_rr_sum * EFFECTIVE_H * DZ # Watts/m^2
+    
+    # 3. Apply Flame Length Correlation (Eq 17/18 logic)
+    # h_flame = h_fuel + 0.0155 * I^0.4
+    # We use DZ as a proxy for h_fuel (surface fuel height)
+    flame_length_map = np.zeros_like(intensity_map)
+    active_fire_mask = intensity_map > 1.0 # Filter noise
+    
+    if np.any(active_fire_mask):
+        # Calculate only for active cells
+        flame_length_map[active_fire_mask] = DZ + 0.0155 * np.power(intensity_map[active_fire_mask], 0.4)
+    
     w_spd, w_dir = wind_info
 
     fig = plt.figure(figsize=(20, 10), dpi=80)
@@ -143,7 +164,7 @@ def render_worker(frame_data):
     ax1 = fig.add_subplot(gs[0, 0])      # Top Left
     ax2 = fig.add_subplot(gs[0, 1:])     # Top Right
     ax3 = fig.add_subplot(gs[1, 0])      # Bottom Left
-    ax4 = fig.add_subplot(gs[1, 1])      # Bottom Middle
+    ax4 = fig.add_subplot(gs[1, 1])      # Bottom Middle (NOW FLAME LENGTH)
     ax5 = fig.add_subplot(gs[1, 2])      # Bottom Right
     
     fig.suptitle(f"Time: {t}s | Global Wind: {w_spd:.1f} m/s @ {w_dir:.0f}°", fontsize=16)
@@ -169,47 +190,33 @@ def render_worker(frame_data):
     masked_ros = np.ma.masked_where(mask | (ros_map == 0), ros_map)
     ax3.imshow(terrain.T, cmap='Greens', alpha=0.3, origin='lower', interpolation='nearest')
     
-    # Smooth ROS visualization
     im3 = ax3.imshow(masked_ros.T, cmap='viridis', vmin=0, vmax=5.0, origin='lower', interpolation='nearest')
     
     plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04).set_label('ROS (m/s)')
     ax3.set_ylabel("Y Distance")
     ax3.set_xlabel("X Distance")
 
-    # 4. Horizontal Wind Field
+    # 4. Flame Length
+    ax4.set_title("Flame Length (m)")
+    
+    # Background: Terrain + Burn Scar
     ax4.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, alpha=0.3, origin='lower', interpolation='nearest')
-    
-    # Overlay Burn Scar (Gray)
     ax4.imshow(burn_scar_mask.T, cmap='gray', vmin=0, vmax=5.0, alpha=0.4, origin='lower', interpolation='nearest')
-
-    ax4.set_title(h_title)
-    ax4.set_facecolor('darkgray') 
+    ax4.set_facecolor('black') 
     
-    if is_history_mode:
-        masked_wind = np.ma.masked_where(h_data < 0.01, h_data)
-        im4 = ax4.imshow(masked_wind.T, cmap='plasma', origin='lower', vmin=0, vmax=5.0, interpolation='nearest')
-        cb_label = 'Disturbance (m/s)'
-    else:
-        masked_wind = np.ma.masked_where(h_data < (w_spd + 0.05), h_data)
-        im4 = ax4.imshow(masked_wind.T, cmap='plasma', origin='lower', vmin=0, vmax=15.0, interpolation='nearest')
-        cb_label = 'Speed (m/s)'
-
+    # Plot Flame Length
+    masked_fl = np.ma.masked_where(flame_length_map < 0.1, flame_length_map)
+    # Using 'inferno' or 'magma' for fire intensity look
+    im4 = ax4.imshow(masked_fl.T, cmap='inferno', origin='lower', vmin=0, vmax=10.0, interpolation='nearest')
+    
+    # Global Wind Arrow (Keep context)
     wind_rad = np.radians(270 - w_dir)
-    # wind_rad = np.radians(w_dir - 90)
     u_glob = np.cos(wind_rad)
     v_glob = np.sin(wind_rad)
-    
     ax4.quiver(0.92, 0.92, u_glob, v_glob, transform=ax4.transAxes, 
-               pivot='middle', scale=10, width=0.02, color='black', zorder=9)
-    ax4.quiver(0.92, 0.92, u_glob, v_glob, transform=ax4.transAxes, 
-               pivot='middle', scale=10, width=0.012, color='white', zorder=10)
+               pivot='middle', scale=10, width=0.02, color='white', zorder=10)
     
-    ax4.text(0.92, 0.82, "Global", transform=ax4.transAxes, 
-             ha='center', va='top', fontsize=8, color='black', fontweight='bold', 
-             bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
-
-    ax4.contour(top_fire.T, levels=[0.1], colors='black', linewidths=0.8, alpha=0.5)
-    plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04).set_label(cb_label)
+    plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04).set_label('Flame Length (m)')
     ax4.set_xlabel("X Distance")
     
     # 5. Vertical Wind Field
@@ -219,7 +226,7 @@ def render_worker(frame_data):
     masked_w = np.ma.masked_where(np.abs(v_data) < 0.1, v_data)
     ax5.set_facecolor('darkgray')
     
-    im5 = ax5.imshow(masked_w.T, cmap='coolwarm', origin='lower', vmin=-1.0, vmax=5.0, interpolation='nearest')
+    im5 = ax5.imshow(masked_w.T, cmap='coolwarm', origin='lower', vmin=-5.0, vmax=10.0, interpolation='nearest')
     ax5.contour(top_fire.T, levels=[0.1], colors='black', linewidths=0.8, alpha=0.5)
 
     plt.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04).set_label('W (m/s)')
@@ -300,72 +307,40 @@ def process_single_run(run_id, args):
         file_tag = "no_wind"
 
     # --- PHASE 1: PRE-CALCULATE PHYSICS & HISTORY ---
-    print("Pre-calculating wind history frames...")
+    print("Pre-calculating vertical wind history...")
     
-    max_h_dist_history = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
+    # We Removed max_h_dist_history (Horizontal Wind) calc to save time
     max_w_history = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
     
-    if wind_local is not None:
-        base_subset = wind_local[0][selected_indices]
-        base_frame = np.mean(base_subset, axis=0)
-        u_base = base_frame[0]
-        v_base = base_frame[1]
-    else:
-        u_base = np.zeros((fuel.shape[1], fuel.shape[2]))
-        v_base = np.zeros_like(u_base)
-
     render_tasks = []
     
     is_history = (args.history == 'on')
-    h_title = f"Cumulative Horizontal Disturbance @ {target_h_str}" if is_history else f"Instantaneous Wind Speed @ {target_h_str}"
     v_title = f"Max Vert Velocity History @ {target_h_str}" if is_history else f"Instantaneous Vertical Wind @ {target_h_str}"
 
     for t in tqdm(range(0, fuel.shape[0], 2), desc="Physics Calc"):
-        u_grid = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
-        v_grid = np.zeros_like(u_grid)
-        w_grid = np.zeros_like(u_grid)
-        current_mag = np.zeros_like(u_grid)
+        w_grid = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
 
         if wind_local is not None:
             current_subset = wind_local[t][selected_indices]
             avg_frame = np.mean(current_subset, axis=0)
-            
-            u_grid = avg_frame[0]
-            v_grid = avg_frame[1]
-            w_grid = avg_frame[2]
+            w_grid = avg_frame[2] # Z component
 
             if args.wind_smooth > 0:
-                u_grid = scipy.ndimage.uniform_filter(u_grid, size=args.wind_smooth)
-                v_grid = scipy.ndimage.uniform_filter(v_grid, size=args.wind_smooth)
                 w_grid = scipy.ndimage.uniform_filter(w_grid, size=args.wind_smooth)
             
-            diff_u = u_grid - u_base
-            diff_v = v_grid - v_base
-            current_disturbance = np.sqrt(diff_u**2 + diff_v**2)
-            np.maximum(max_h_dist_history, current_disturbance, out=max_h_dist_history)
-
             update_mask_w = np.abs(w_grid) > np.abs(max_w_history)
             max_w_history[update_mask_w] = w_grid[update_mask_w]
-            
-            current_mag = np.sqrt(u_grid**2 + v_grid**2)
 
         if is_history:
-            h_data_frame = max_h_dist_history.copy()
             v_data_frame = max_w_history.copy()
         else:
-            h_data_frame = current_mag.copy()
             v_data_frame = w_grid.copy()
 
         task_data = {
             't': t,
-            'u': u_grid, 
-            'v': v_grid,
-            'h_data': h_data_frame,
             'v_data': v_data_frame,
             'wind_info': wind_info,
-            'h_title': h_title,
             'v_title': v_title,
-            'is_history_mode': is_history
         }
         render_tasks.append(task_data)
 
@@ -381,7 +356,7 @@ def process_single_run(run_id, args):
             frames.append(frame)
 
     suffix_str = args.suffix if args.suffix else ""
-    output_filename = f"run_{run_id}_viz_{args.history}_{file_tag}_{suffix_str}.mp4"
+    output_filename = f"run_{run_id}_viz_FL_{file_tag}_{suffix_str}.mp4"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
         
     print(f"Saving video to {output_path}...")
@@ -397,8 +372,7 @@ def main():
     parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1), help="Number of render processes")
     parser.add_argument("--height", type=float, default=5.0, help="Height level to visualize (typically 5, 10, 15)")
     parser.add_argument("--average", type=str, default=None, help="Comma-separated list of heights to average")
-    # Added explicit --runs arg as requested, though positional 'run_id' handles it too. 
-    # To keep interface clean, I'll parse the main positional arg 'run_id' to support lists/ranges.
+
     args = parser.parse_args()
 
     # Parse Run IDs

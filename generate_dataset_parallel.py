@@ -7,15 +7,15 @@ import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import config
-import run_gpu
+import config_new as config
+import run_gpu_new as run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_big"
+DATA_DIR = "./training_data_new"
 STATS_DIR = "./training_data_v2_stats"
-NUM_SAMPLES = 1
-NUM_WORKERS = 1  # A100 has 40GB VRAM, can handle multiple sims
+NUM_SAMPLES = 8
+NUM_WORKERS = 8  # A100 has 40GB VRAM, can handle multiple sims
 
 def generate_single_sample(run_id):
     """
@@ -37,7 +37,7 @@ def generate_single_sample(run_id):
         speed = np.random.uniform(10.0, 20.0)
         direction = np.random.uniform(0.0, 360.0)
         # direction = np.random.choice([0.0, 90.0, 180.0, 270.0])
-        moisture = np.random.uniform(0.1, 1.0)
+        moisture = np.random.uniform(0.05, 0.4)
         # moisture = np.random.choice([0.1, 0.5, 1.0, 100])
 
         # defaults
