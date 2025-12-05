@@ -12,7 +12,7 @@ import run_gpu_new as run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_new"
+DATA_DIR = "./training_data_new_moisture"
 STATS_DIR = "./training_data_v2_stats"
 NUM_SAMPLES = 8
 NUM_WORKERS = 8  # A100 has 40GB VRAM, can handle multiple sims

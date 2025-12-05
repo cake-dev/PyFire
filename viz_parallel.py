@@ -14,8 +14,8 @@ from functools import partial
 import config
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_new"
-OUTPUT_DIR = "./visualizations_new"
+DATA_DIR = "./training_data_new_moisture"
+OUTPUT_DIR = "./visualizations_new_moisture"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DX = config.DX
@@ -68,9 +68,12 @@ def load_data(run_id):
         w_spd = float(data['wind_speed'][0]) if 'wind_speed' in data else 0.0
         w_dir = float(data['wind_dir'][0]) if 'wind_dir' in data else 0.0
         
+        # EXTRACT MOISTURE
+        moisture = float(data['moisture'][0]) if 'moisture' in data else 0.0
+        
         wind_heights = data['wind_heights'] if 'wind_heights' in data else np.array([5.0])
         
-    return fuel, rr, terrain, wind_local, (w_spd, w_dir), wind_heights
+    return fuel, rr, terrain, wind_local, (w_spd, w_dir, moisture), wind_heights
 
 def calculate_ros_map(rr_vol):
     if rr_vol.ndim == 4:
@@ -127,7 +130,7 @@ def render_worker(frame_data):
 
     # --- RENDER LOGIC ---
     f_t = fuel_vol[t]
-    r_t = rr_vol[t].astype(np.float32) # Fix: Cast to float32 to prevent overflow during Intensity calc
+    r_t = rr_vol[t].astype(np.float32)
     
     top_fuel = np.max(f_t, axis=2) 
     top_fire = np.max(r_t, axis=2)
@@ -139,24 +142,17 @@ def render_worker(frame_data):
     burn_scar_mask = np.ma.masked_where(fuel_loss < 0.1, fuel_loss)
     
     # --- FLAME LENGTH CALCULATION ---
-    # 1. Integrate Reaction Rate (kg/m3/s) vertically to get column sum
-    # 2. Convert to Heat Release Rate (Watts/m2)
-    #    Intensity = Sum(rr * dz) * Effective_Heat
-    # Note: rr is density change per second.
     column_rr_sum = np.sum(r_t, axis=2) # Sum over Z
     intensity_map = column_rr_sum * EFFECTIVE_H * DZ # Watts/m^2
     
-    # 3. Apply Flame Length Correlation (Eq 17/18 logic)
-    # h_flame = h_fuel + 0.0155 * I^0.4
-    # We use DZ as a proxy for h_fuel (surface fuel height)
     flame_length_map = np.zeros_like(intensity_map)
-    active_fire_mask = intensity_map > 1.0 # Filter noise
+    active_fire_mask = intensity_map > 1.0 
     
     if np.any(active_fire_mask):
-        # Calculate only for active cells
         flame_length_map[active_fire_mask] = DZ + 0.0155 * np.power(intensity_map[active_fire_mask], 0.4)
     
-    w_spd, w_dir = wind_info
+    # Unpack wind info
+    w_spd, w_dir, moisture = wind_info
 
     fig = plt.figure(figsize=(20, 10), dpi=80)
     gs = gridspec.GridSpec(2, 3, height_ratios=[1, 1], width_ratios=[1, 1, 1])
@@ -164,10 +160,11 @@ def render_worker(frame_data):
     ax1 = fig.add_subplot(gs[0, 0])      # Top Left
     ax2 = fig.add_subplot(gs[0, 1:])     # Top Right
     ax3 = fig.add_subplot(gs[1, 0])      # Bottom Left
-    ax4 = fig.add_subplot(gs[1, 1])      # Bottom Middle (NOW FLAME LENGTH)
+    ax4 = fig.add_subplot(gs[1, 1])      # Bottom Middle
     ax5 = fig.add_subplot(gs[1, 2])      # Bottom Right
     
-    fig.suptitle(f"Time: {t}s | Global Wind: {w_spd:.1f} m/s @ {w_dir:.0f}°", fontsize=16)
+    # Updated Title with Moisture
+    fig.suptitle(f"Time: {t}s | Wind: {w_spd:.1f} m/s @ {w_dir:.0f}° | Moisture: {moisture*100:.1f}%", fontsize=16)
 
     # 1. Top-Down State
     ax1.set_title("Top-Down State")
@@ -198,18 +195,13 @@ def render_worker(frame_data):
 
     # 4. Flame Length
     ax4.set_title("Flame Length (m)")
-    
-    # Background: Terrain + Burn Scar
     ax4.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, alpha=0.3, origin='lower', interpolation='nearest')
     ax4.imshow(burn_scar_mask.T, cmap='gray', vmin=0, vmax=5.0, alpha=0.4, origin='lower', interpolation='nearest')
     ax4.set_facecolor('black') 
     
-    # Plot Flame Length
     masked_fl = np.ma.masked_where(flame_length_map < 0.1, flame_length_map)
-    # Using 'inferno' or 'magma' for fire intensity look
     im4 = ax4.imshow(masked_fl.T, cmap='inferno', origin='lower', vmin=0, vmax=10.0, interpolation='nearest')
     
-    # Global Wind Arrow (Keep context)
     wind_rad = np.radians(270 - w_dir)
     u_glob = np.cos(wind_rad)
     v_glob = np.sin(wind_rad)
@@ -226,7 +218,7 @@ def render_worker(frame_data):
     masked_w = np.ma.masked_where(np.abs(v_data) < 0.1, v_data)
     ax5.set_facecolor('darkgray')
     
-    im5 = ax5.imshow(masked_w.T, cmap='coolwarm', origin='lower', vmin=-5.0, vmax=10.0, interpolation='nearest')
+    im5 = ax5.imshow(masked_w.T, cmap='coolwarm', origin='lower', vmin=-1.0, vmax=5.0, interpolation='nearest')
     ax5.contour(top_fire.T, levels=[0.1], colors='black', linewidths=0.8, alpha=0.5)
 
     plt.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04).set_label('W (m/s)')
@@ -257,7 +249,8 @@ def process_single_run(run_id, args):
     print("Calculating Rate of Spread Map...")
     arrival_indices, ros_map = calculate_ros_map(rr)
     
-    w_spd = wind_info[0]
+    # Unpack wind_info for processing
+    w_spd, w_dir, moisture = wind_info
 
     # --- DETERMINE Z-MODE ---
     selected_indices = []
@@ -309,7 +302,6 @@ def process_single_run(run_id, args):
     # --- PHASE 1: PRE-CALCULATE PHYSICS & HISTORY ---
     print("Pre-calculating vertical wind history...")
     
-    # We Removed max_h_dist_history (Horizontal Wind) calc to save time
     max_w_history = np.zeros((fuel.shape[1], fuel.shape[2]), dtype=np.float32)
     
     render_tasks = []

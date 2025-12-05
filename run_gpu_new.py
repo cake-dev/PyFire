@@ -36,7 +36,6 @@ def run_simulation(params, run_id, output_dir):
     else:
         elevation_host = np.zeros((nx, ny), dtype=np.float32)
 
-    # Note: Physics Elevation smoothing kept as it helps numerical stability of wind solver
     elevation_physics = scipy.ndimage.gaussian_filter(elevation_host, sigma=1.5)
 
     z_coords_host = np.arange(nz) * dz
@@ -68,6 +67,8 @@ def run_simulation(params, run_id, output_dir):
     incoming_z_dev = cuda.device_array((nx, ny, nz), dtype=np.float32)
     n_ep_received_dev = cuda.device_array((nx, ny, nz), dtype=np.int32)
     ep_counts_dev = cuda.device_array((nx, ny, nz), dtype=np.int32)
+    
+    # MOISTURE SETUP
     fuel_moisture_dev = cuda.to_device(np.ones((nx, ny, nz), dtype=np.float32) * moisture)
 
     gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](reaction_rate_dev)
@@ -134,14 +135,14 @@ def run_simulation(params, run_id, output_dir):
             w_dev, reaction_rate_dev, dx, dy, dz, config.G, config.RHO_AIR, config.CP_AIR, config.T_AMBIENT, config.H_WOOD
         )
         
-        # 3. Fire Logic
+        # 3. Fire Logic (PASS H_H2O_EFF)
         fire_gpu.compute_reaction_and_fuel_kernel[blocks_per_grid, threads_per_block](
             fuel_dev, fuel_moisture_dev, 
             n_ep_received_dev, incoming_x_dev, incoming_y_dev, incoming_z_dev,
             centroid_x_dev, centroid_y_dev, centroid_z_dev, ep_history_dev,
             time_since_ignition_dev, reaction_rate_dev, ep_counts_dev,
             config.DT, config.CM, config.T_BURNOUT, config.H_WOOD, vol, config.C_RAD_LOSS, config.EEP,
-            config.CP_WOOD, config.T_CRIT, config.T_AMBIENT
+            config.CP_WOOD, config.T_CRIT, config.T_AMBIENT, config.H_H2O_EFF
         )
         
         gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](n_ep_received_dev)
@@ -150,7 +151,7 @@ def run_simulation(params, run_id, output_dir):
         gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](incoming_z_dev)
         cuda.synchronize()
         
-        # 4. Transport (Updated signature without hacks)
+        # 4. Transport
         fire_gpu.transport_eps_kernel[blocks_per_grid, threads_per_block](
             ep_counts_dev, 
             n_ep_received_dev, incoming_x_dev, incoming_y_dev, incoming_z_dev,
