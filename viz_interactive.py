@@ -270,7 +270,7 @@ if st.session_state.running:
         render_frame()
         
         # Throttle to ~20 FPS so browser doesn't freeze
-        time.sleep(0.05)
+        time.sleep(0.1)
     
     # Force a rerun to sync sliders/buttons and clear memory
     # This causes a momentary "flash" but keeps the app responsive and stable

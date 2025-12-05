@@ -14,8 +14,8 @@ import world_gen
 # Output directory
 DATA_DIR = "./training_data_big"
 STATS_DIR = "./training_data_v2_stats"
-NUM_SAMPLES = 4
-NUM_WORKERS = 4  # A100 has 40GB VRAM, can handle multiple sims
+NUM_SAMPLES = 1
+NUM_WORKERS = 1  # A100 has 40GB VRAM, can handle multiple sims
 
 def generate_single_sample(run_id):
     """

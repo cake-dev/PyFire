@@ -145,12 +145,8 @@ def transport_eps_kernel(ep_counts,
                 phi = w_star / (w_star + u_horiz + 1e-6)
                 
                 # C. Bifurcate Loop per EP
-                # We can't loop every EP individually for performance, so we do it in batches 
-                # or use the probability to weight the vector.
-                # Paper approach: The PLUME behaves one way, but EPs represent chunks.
-                # We'll use a stochastic check for the whole batch or apply a weighted vector.
                 
-                # Let's apply the paper's "Binary Choice" stochastically to the vector
+                # apply the paper's "Binary Choice" stochastically to the vector
                 # Prob of going Vertical (Tower) = Phi
                 rnd_bifurcation = xoroshiro128p_uniform_float32(rng_states, rng_idx)
                 
