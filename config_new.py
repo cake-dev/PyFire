@@ -26,7 +26,7 @@ T_CRIT = 500.0
 N_F = 0.4552
 N_O2 = 0.5448
 
-EEP = 50000.0 # Watts (J/s)
+EEP = 5000.0 # Watts (J/s)
 C_RAD_LOSS = 0.2
 T_BURNOUT = 30.0 
 
