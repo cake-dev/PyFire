@@ -7,12 +7,14 @@ import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import config_new as config
-import run_gpu_new as run_gpu
+# import config_new as config
+import config_stable as config
+# import run_gpu_new as run_gpu
+import run_gpu_stable as run_gpu
 import world_gen
 
 # Output directory
-DATA_DIR = "./training_data_new_moisture"
+DATA_DIR = "./training_data_stable"
 STATS_DIR = "./training_data_v2_stats"
 NUM_SAMPLES = 8
 NUM_WORKERS = 8  # A100 has 40GB VRAM, can handle multiple sims

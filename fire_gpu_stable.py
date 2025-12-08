@@ -1,6 +1,7 @@
 import math
 from numba import cuda
 from numba.cuda.random import xoroshiro128p_normal_float32, xoroshiro128p_uniform_float32
+import config
 
 @cuda.jit
 def compute_reaction_and_fuel_kernel(fuel_density, fuel_moisture, 
@@ -8,7 +9,7 @@ def compute_reaction_and_fuel_kernel(fuel_density, fuel_moisture,
                                      centroid_x, centroid_y, centroid_z, ep_history,
                                      time_since_ignition, reaction_rate, ep_counts, 
                                      dt, cm, t_burnout, h_wood, vol, c_rad_loss, eep,
-                                     cp_wood, t_crit, t_ambient, h_h2o_eff):
+                                     cp_wood, t_crit, t_ambient):
     i, j, k = cuda.grid(3)
     nx, ny, nz = fuel_density.shape
     
@@ -42,39 +43,15 @@ def compute_reaction_and_fuel_kernel(fuel_density, fuel_moisture,
             
             ep_history[i, j, k] = total_count
 
-        # --- 2. Moisture Evaporation Physics ---
+        # --- 2. Reaction Physics ---
         rho_f = fuel_density[i, j, k]
-        moisture = fuel_moisture[i, j, k]
-        
-        # Calculate Energy Received in this timestep (Joules)
-        energy_in = n_new * eep * dt
-        
-        # FACTOR TO SPEED UP DRYING (Game-feel adjustment)
-        # Without this, standard EEP is often too weak to overcome high moisture quickly
-        DRYING_FACTOR = 10.0 
-        
-        if rho_f > 1e-4 and energy_in > 0 and moisture > 0.05:
-            # Total mass of water in cell
-            mass_water = rho_f * vol * moisture
-            
-            # Mass we can evaporate (boosted by factor)
-            evap_mass = (energy_in * DRYING_FACTOR) / h_h2o_eff
-            
-            if evap_mass > mass_water:
-                fuel_moisture[i, j, k] = 0.0 # Dried completely
-            else:
-                new_mass_water = mass_water - evap_mass
-                fuel_moisture[i, j, k] = new_mass_water / (rho_f * vol)
-
-        # --- 3. Reaction Physics ---
         rr = 0.0
         
         if rho_f > 1e-4:
-            # Ignition Gating: Must be effectively dry (<5% moisture)
-            is_dry = fuel_moisture[i, j, k] <= 0.05
+            has_energy = n_ep_received[i, j, k] > 0
             is_burning = time_since_ignition[i, j, k] > 0
             
-            if (n_new > 0 or is_burning) and is_dry:
+            if has_energy or is_burning:
                 if time_since_ignition[i, j, k] == 0:
                     time_since_ignition[i, j, k] = 0.01
                 
@@ -136,19 +113,34 @@ def transport_eps_kernel(ep_counts,
             
             # --- Intensity & Updraft ---
             area_cell = dx * dy 
+            # Intensity in Watts/m^2
             intensity = (count * eep) / area_cell 
             
+            # CRITICAL FIX: Scaling w_star to prevent infinite vertical transport.
+            # Using a power-law approximation for buoyant velocity (w ~ I^1/3) 
+            # instead of linear to keep values in physical range (1-10 m/s).
+            # 0.377 factor kept from paper, but I scaled to kW/m2 to behave well.
             w_star = 0.377 * math.pow(intensity * 0.001, 0.4) 
             if w_star < 0.1: w_star = 0.1
 
+            # --- Dominance Ratio (Phi) ---
             phi = w_star / (w_star + u_horiz + 1e-6)
             
+            # --- Length Scale ---
+            # h_flame from Eq 17/18 logic. Using dz (fuel height) as base.
+            # I in Watts works well for this empirical correlation.
             h_flame = dz + 0.0155 * math.pow(intensity, 0.4)
+            
             stretch = 1.0
             if w_star > 1e-6:
+                # Froude number-like stretch
                 stretch = math.sqrt((uc*uc + vc*vc)/(w_star*w_star))
+                
             l_scale = h_flame * max(1.0, stretch)
             
+            # GRID CONNECTIVITY FIX:
+            # If l_scale is smaller than grid spacing (dx), fire cannot spread.
+            # We enforce a minimum length scale if wind is pushing.
             if u_horiz > 0.5:
                 l_scale = max(l_scale, dx * 1.5)
             
@@ -157,12 +149,15 @@ def transport_eps_kernel(ep_counts,
             
             # --- Wind Transport ---
             if n_wind > 0:
+                # Bifurcation
                 rnd_bifurcation = xoroshiro128p_uniform_float32(rng_states, rng_idx)
                 is_tower = rnd_bifurcation < phi
                 
+                # Distance (Triangular distribution peak at 0)
                 rnd_dist = xoroshiro128p_uniform_float32(rng_states, rng_idx)
                 dist_travel = l_scale * (1.0 - math.sqrt(1.0 - rnd_dist))
                 
+                # Turbulence
                 tke_est = 0.1 * (u_horiz + w_star)
                 pert_mag = math.sqrt(tke_est) * 0.5
                 u_pert = xoroshiro128p_normal_float32(rng_states, rng_idx) * pert_mag
@@ -174,6 +169,7 @@ def transport_eps_kernel(ep_counts,
                 dz_travel = 0.0
 
                 if is_tower:
+                    # Tower: Vertical bias
                     total_w = w_star + wc + w_pert
                     total_u = uc * 0.2 + u_pert 
                     total_v = vc * 0.2 + v_pert
@@ -183,6 +179,7 @@ def transport_eps_kernel(ep_counts,
                         dy_travel = (total_v / mag) * dist_travel
                         dz_travel = (total_w / mag) * dist_travel
                 else:
+                    # Trough: Horizontal bias
                     total_w = wc + w_pert 
                     total_u = uc + u_pert
                     total_v = vc + v_pert
@@ -200,27 +197,18 @@ def transport_eps_kernel(ep_counts,
                 dj = int(math.floor(dest_y_glob))
                 dk = int(math.floor(dest_z_glob))
                 
-                # --- TERRAIN CLAMPING FIX ---
-                if 0 <= di < nx and 0 <= dj < ny:
-                    # Get Ground Z index at destination
-                    ground_z_meters = elevation[di, dj]
-                    ground_k = int(ground_z_meters / dz)
-                    
-                    # If packet is underground, force it to surface fuel layer
-                    if dk < ground_k:
-                        dk = ground_k
-                    
-                    if 0 <= dk < nz:
-                        off_x = dest_x_glob - di
-                        off_y = dest_y_glob - dj
-                        off_z = dest_z_glob - dk
-                        cuda.atomic.add(n_ep_received, (di, dj, dk), n_wind)
-                        cuda.atomic.add(incoming_x, (di, dj, dk), off_x * n_wind)
-                        cuda.atomic.add(incoming_y, (di, dj, dk), off_y * n_wind)
-                        cuda.atomic.add(incoming_z, (di, dj, dk), off_z * n_wind)
+                if 0 <= di < nx and 0 <= dj < ny and 0 <= dk < nz:
+                    off_x = dest_x_glob - di
+                    off_y = dest_y_glob - dj
+                    off_z = dest_z_glob - dk
+                    cuda.atomic.add(n_ep_received, (di, dj, dk), n_wind)
+                    cuda.atomic.add(incoming_x, (di, dj, dk), off_x * n_wind)
+                    cuda.atomic.add(incoming_y, (di, dj, dk), off_y * n_wind)
+                    cuda.atomic.add(incoming_z, (di, dj, dk), off_z * n_wind)
 
             # --- Creeping Transport ---
             if n_creeping > 0:
+                # Ensure creeping can cross at least one cell
                 l_creep = max(2.0, dx * 1.2)
                 
                 theta = xoroshiro128p_uniform_float32(rng_states, rng_idx) * 2.0 * 3.14159
@@ -236,20 +224,11 @@ def transport_eps_kernel(ep_counts,
                 dj = int(math.floor(dest_y_glob))
                 dk = int(math.floor(dest_z_glob))
                 
-                if 0 <= di < nx and 0 <= dj < ny:
-                    # Creeping also needs terrain awareness 
-                    # (though usually close to ground anyway)
-                    ground_z_meters = elevation[di, dj]
-                    ground_k = int(ground_z_meters / dz)
-                    
-                    if dk < ground_k:
-                        dk = ground_k
-
-                    if 0 <= dk < nz:
-                        off_x = dest_x_glob - di
-                        off_y = dest_y_glob - dj
-                        off_z = dest_z_glob - dk
-                        cuda.atomic.add(n_ep_received, (di, dj, dk), n_creeping)
-                        cuda.atomic.add(incoming_x, (di, dj, dk), off_x * n_creeping)
-                        cuda.atomic.add(incoming_y, (di, dj, dk), off_y * n_creeping)
-                        cuda.atomic.add(incoming_z, (di, dj, dk), off_z * n_creeping)
+                if 0 <= di < nx and 0 <= dj < ny and 0 <= dk < nz:
+                    off_x = dest_x_glob - di
+                    off_y = dest_y_glob - dj
+                    off_z = dest_z_glob - dk
+                    cuda.atomic.add(n_ep_received, (di, dj, dk), n_creeping)
+                    cuda.atomic.add(incoming_x, (di, dj, dk), off_x * n_creeping)
+                    cuda.atomic.add(incoming_y, (di, dj, dk), off_y * n_creeping)
+                    cuda.atomic.add(incoming_z, (di, dj, dk), off_z * n_creeping)

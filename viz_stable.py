@@ -11,11 +11,11 @@ from tqdm import tqdm
 import scipy.ndimage
 import multiprocessing as mp
 from functools import partial
-import config_new as config
+import config_stable as config
 
 # --- CONFIGURATION ---
-DATA_DIR = "./training_data_new_moisture"
-OUTPUT_DIR = "./visualizations_new_moisture"
+DATA_DIR = "./training_data_stable"
+OUTPUT_DIR = "./visualizations_stable"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DX = config.DX
@@ -25,20 +25,19 @@ DZ = config.DZ
 
 # Physics Constants for Flame Length Calc
 H_WOOD = config.H_WOOD
-CP_WOOD = getattr(config, 'CP_WOOD', 1700.0)
-T_CRIT = getattr(config, 'T_CRIT', 500.0)
-T_AMBIENT = getattr(config, 'T_AMBIENT', 300.0)
+CP_WOOD = config.CP_WOOD
+T_CRIT = config.T_CRIT
+T_AMBIENT = config.T_AMBIENT
 EFFECTIVE_H = H_WOOD - CP_WOOD * (T_CRIT - T_AMBIENT)
 
 # --- GLOBAL SHARED DATA (For Worker Processes) ---
 shared_data = {}
 
-def init_worker(fuel, rr, moisture, terrain, ros_map, arrival_indices):
+def init_worker(fuel, rr, terrain, ros_map, arrival_indices):
     """Initialize global data for worker processes."""
     shared_data['fuel'] = fuel
     shared_data['initial_fuel'] = fuel[0] # Store initial state for burn scar calc
     shared_data['rr'] = rr
-    shared_data['moisture'] = moisture # Shared Moisture Data
     shared_data['terrain'] = terrain
     shared_data['ros_map'] = ros_map
     shared_data['arrival_indices'] = arrival_indices
@@ -69,27 +68,12 @@ def load_data(run_id):
         w_spd = float(data['wind_speed'][0]) if 'wind_speed' in data else 0.0
         w_dir = float(data['wind_dir'][0]) if 'wind_dir' in data else 0.0
         
-        # --- EXTRACT MOISTURE ---
-        moisture_scalar = 0.0
-        moisture_vol = None
+        # EXTRACT MOISTURE
+        moisture = float(data['moisture'][0]) if 'moisture' in data else 0.0
         
-        if 'moisture' in data:
-            m_data = data['moisture']
-            if m_data.ndim == 4: # New format
-                moisture_vol = m_data
-                moisture_scalar = np.mean(m_data[0]) 
-            elif m_data.ndim == 1: # Old format
-                moisture_scalar = float(m_data[0])
-                moisture_vol = np.ones_like(fuel) * moisture_scalar
-            else:
-                moisture_scalar = float(m_data)
-                moisture_vol = np.ones_like(fuel) * moisture_scalar
-        else:
-             moisture_vol = np.zeros_like(fuel)
-
         wind_heights = data['wind_heights'] if 'wind_heights' in data else np.array([5.0])
         
-    return fuel, rr, moisture_vol, terrain, wind_local, (w_spd, w_dir, moisture_scalar), wind_heights
+    return fuel, rr, terrain, wind_local, (w_spd, w_dir, moisture), wind_heights
 
 def calculate_ros_map(rr_vol):
     if rr_vol.ndim == 4:
@@ -103,17 +87,26 @@ def calculate_ros_map(rr_vol):
     never_burnt_mask = (arrival_indices == 0) & (~is_burnt[0])
     arrival_time = arrival_indices * DT
     
+    # 1. Smooth the arrival time first (Time Domain Smoothing)
     smoothed_time = scipy.ndimage.gaussian_filter(arrival_time, sigma=1.5)
+    
+    # 2. Calculate Gradients
     grads = np.gradient(smoothed_time, DX)
     dt_dy, dt_dx = grads
     slowness = np.sqrt(dt_dx**2 + dt_dy**2)
     
+    # 3. Invert for Rate of Spread
     with np.errstate(divide='ignore'):
         ros_map = 1.0 / slowness
     
+    # Cap infinite/high values
     ros_map[ros_map > 30.0] = 30.0 
+    
+    # Apply Kernel Smoothing to the ROS Map
     ros_map = scipy.ndimage.median_filter(ros_map, size=3)
     ros_map = scipy.ndimage.gaussian_filter(ros_map, sigma=1.0)
+
+    # Re-apply mask
     ros_map[never_burnt_mask] = 0
     
     return arrival_indices, ros_map
@@ -131,7 +124,6 @@ def render_worker(frame_data):
     fuel_vol = shared_data['fuel']
     fuel_0 = shared_data['initial_fuel']
     rr_vol = shared_data['rr']
-    moisture_vol = shared_data['moisture'] 
     terrain = shared_data['terrain']
     ros_map = shared_data['ros_map']
     arrival_map = shared_data['arrival_indices']
@@ -139,100 +131,96 @@ def render_worker(frame_data):
     # --- RENDER LOGIC ---
     f_t = fuel_vol[t]
     r_t = rr_vol[t].astype(np.float32)
-    m_t = moisture_vol[t] 
     
     top_fuel = np.max(f_t, axis=2) 
     top_fire = np.max(r_t, axis=2)
-    
-    # MOISTURE VIZ FIX: 
-    # Use min() across Z to see the drying scar regardless of where it happens in the column.
-    # Fire sets moisture to 0.0, so the path will appear distinctly white.
-    top_moisture = np.min(m_t, axis=2)
-    
     side_fuel = np.max(f_t, axis=1)
     side_fire = np.max(r_t, axis=1)
     
+    # Calculate Burn Scar
     fuel_loss = np.sum(fuel_0, axis=2) - np.sum(f_t, axis=2)
     burn_scar_mask = np.ma.masked_where(fuel_loss < 0.1, fuel_loss)
     
-    # Flame Length
-    column_rr_sum = np.sum(r_t, axis=2)
-    intensity_map = column_rr_sum * EFFECTIVE_H * DZ
+    # --- FLAME LENGTH CALCULATION ---
+    column_rr_sum = np.sum(r_t, axis=2) # Sum over Z
+    intensity_map = column_rr_sum * EFFECTIVE_H * DZ # Watts/m^2
+    
     flame_length_map = np.zeros_like(intensity_map)
     active_fire_mask = intensity_map > 1.0 
+    
     if np.any(active_fire_mask):
         flame_length_map[active_fire_mask] = DZ + 0.0155 * np.power(intensity_map[active_fire_mask], 0.4)
     
-    w_spd, w_dir, moisture_scalar = wind_info
+    # Unpack wind info
+    w_spd, w_dir, moisture = wind_info
 
     fig = plt.figure(figsize=(20, 10), dpi=80)
     gs = gridspec.GridSpec(2, 3, height_ratios=[1, 1], width_ratios=[1, 1, 1])
     
-    ax1 = fig.add_subplot(gs[0, 0])      # Top Left: State
-    ax_mois = fig.add_subplot(gs[0, 1])  # Top Mid: Moisture
-    ax2 = fig.add_subplot(gs[0, 2])      # Top Right: Side View
-    ax3 = fig.add_subplot(gs[1, 0])      # Bot Left: ROS
-    ax4 = fig.add_subplot(gs[1, 1])      # Bot Mid: Flame Len
-    ax5 = fig.add_subplot(gs[1, 2])      # Bot Right: Wind
+    ax1 = fig.add_subplot(gs[0, 0])      # Top Left
+    ax2 = fig.add_subplot(gs[0, 1:])     # Top Right
+    ax3 = fig.add_subplot(gs[1, 0])      # Bottom Left
+    ax4 = fig.add_subplot(gs[1, 1])      # Bottom Middle
+    ax5 = fig.add_subplot(gs[1, 2])      # Bottom Right
     
-    fig.suptitle(f"Time: {t}s | Wind: {w_spd:.1f} m/s @ {w_dir:.0f}° | Init Moisture: {moisture_scalar*100:.1f}%", fontsize=16)
+    # Updated Title with Moisture
+    fig.suptitle(f"Time: {t}s | Wind: {w_spd:.1f} m/s @ {w_dir:.0f}° | Moisture: {moisture*100:.1f}%", fontsize=16)
 
     # 1. Top-Down State
-    ax1.set_title("Fuel & Fire Intensity")
+    ax1.set_title("Top-Down State")
     ax1.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, origin='lower', interpolation='nearest')
     ax1.contour(terrain.T, levels=8, colors='white', alpha=0.3, linewidths=0.5)
     ax1.imshow(top_fire.T, cmap='hot', vmin=0.0, vmax=1.0, alpha=0.7, origin='lower', interpolation='nearest')
     ax1.set_ylabel("Y Distance")
     ax1.set_xlabel("X Distance")
-    
-    # 2. Fuel Moisture
-    ax_mois.set_title("Min Column Moisture (Drying Track)")
-    # Blues: Dark = Wet, White = Dry (0.0)
-    vmax_m = max(0.1, moisture_scalar * 1.5)
-    im_m = ax_mois.imshow(top_moisture.T, cmap='Blues', vmin=0.0, vmax=vmax_m, origin='lower', interpolation='nearest')
-    ax_mois.contour(top_fire.T, levels=[0.1], colors='red', linewidths=1.0, alpha=0.6)
-    plt.colorbar(im_m, ax=ax_mois, fraction=0.046, pad=0.04).set_label('Moisture Fraction')
-    ax_mois.set_xlabel("X Distance")
 
-    # 3. Side View
+    # 2. Side View
     ax2.set_title("Side View (XZ Profile)")
     ax2.imshow(side_fuel.T, cmap='Greens', vmin=0, vmax=2.0, origin='lower', aspect='auto', interpolation='nearest')
     ax2.imshow(side_fire.T, cmap='hot', vmin=0.0, vmax=1.0, alpha=0.9, origin='lower', aspect='auto', interpolation='nearest')
     ax2.set_ylabel("Z Height")
     ax2.set_xlabel("X Distance")
 
-    # 4. ROS
+    # 3. ROS
     ax3.set_title("Instantaneous Rate of Spread (m/s)")
     mask = arrival_map > t 
     masked_ros = np.ma.masked_where(mask | (ros_map == 0), ros_map)
     ax3.imshow(terrain.T, cmap='Greens', alpha=0.3, origin='lower', interpolation='nearest')
+    
     im3 = ax3.imshow(masked_ros.T, cmap='viridis', vmin=0, vmax=5.0, origin='lower', interpolation='nearest')
+    
     plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04).set_label('ROS (m/s)')
     ax3.set_ylabel("Y Distance")
     ax3.set_xlabel("X Distance")
 
-    # 5. Flame Length
+    # 4. Flame Length
     ax4.set_title("Flame Length (m)")
     ax4.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, alpha=0.3, origin='lower', interpolation='nearest')
     ax4.imshow(burn_scar_mask.T, cmap='gray', vmin=0, vmax=5.0, alpha=0.4, origin='lower', interpolation='nearest')
     ax4.set_facecolor('black') 
+    
     masked_fl = np.ma.masked_where(flame_length_map < 0.1, flame_length_map)
     im4 = ax4.imshow(masked_fl.T, cmap='inferno', origin='lower', vmin=0, vmax=10.0, interpolation='nearest')
+    
     wind_rad = np.radians(270 - w_dir)
     u_glob = np.cos(wind_rad)
     v_glob = np.sin(wind_rad)
     ax4.quiver(0.92, 0.92, u_glob, v_glob, transform=ax4.transAxes, 
                pivot='middle', scale=10, width=0.02, color='white', zorder=10)
+    
     plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04).set_label('Flame Length (m)')
     ax4.set_xlabel("X Distance")
     
-    # 6. Vertical Wind Field
+    # 5. Vertical Wind Field
     ax5.imshow(top_fuel.T, cmap='Greens', vmin=0, vmax=2.0, alpha=0.3, origin='lower', interpolation='nearest')
     ax5.set_title(v_title)
+    
     masked_w = np.ma.masked_where(np.abs(v_data) < 0.1, v_data)
     ax5.set_facecolor('darkgray')
+    
     im5 = ax5.imshow(masked_w.T, cmap='coolwarm', origin='lower', vmin=-1.0, vmax=5.0, interpolation='nearest')
     ax5.contour(top_fire.T, levels=[0.1], colors='black', linewidths=0.8, alpha=0.5)
+
     plt.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04).set_label('W (m/s)')
     ax5.set_xlabel("X Distance")
 
@@ -246,6 +234,9 @@ def render_worker(frame_data):
     return image_rgba[:, :, :3]
 
 def process_single_run(run_id, args):
+    """
+    Encapsulates the entire visualization pipeline for one run ID.
+    """
     print(f"\n--- Processing Run {run_id} ---")
     print(f"Loading data...")
     data = load_data(run_id)
@@ -253,12 +244,13 @@ def process_single_run(run_id, args):
         print(f"Skipping Run {run_id} (Data not found)")
         return
         
-    fuel, rr, moisture_vol, terrain, wind_local, wind_info, wind_heights = data
+    fuel, rr, terrain, wind_local, wind_info, wind_heights = data
     
     print("Calculating Rate of Spread Map...")
     arrival_indices, ros_map = calculate_ros_map(rr)
     
-    w_spd, w_dir, moisture_scalar = wind_info
+    # Unpack wind_info for processing
+    w_spd, w_dir, moisture = wind_info
 
     # --- DETERMINE Z-MODE ---
     selected_indices = []
@@ -347,10 +339,10 @@ def process_single_run(run_id, args):
     print(f"Rendering {len(render_tasks)} frames on {args.workers} CPUs...")
     
     frames = []
-    # Pass moisture volume to init_worker
+    # Re-initialize pool for each run to keep memory clean
     with mp.Pool(processes=args.workers, 
                  initializer=init_worker, 
-                 initargs=(fuel, rr, moisture_vol, terrain, ros_map, arrival_indices)) as pool:
+                 initargs=(fuel, rr, terrain, ros_map, arrival_indices)) as pool:
         
         for frame in tqdm(pool.imap(render_worker, render_tasks), total=len(render_tasks), desc="Rendering"):
             frames.append(frame)
@@ -375,6 +367,7 @@ def main():
 
     args = parser.parse_args()
 
+    # Parse Run IDs
     run_ids = []
     try:
         if '-' in args.run_id:

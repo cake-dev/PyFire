@@ -1,9 +1,9 @@
 import numpy as np
 import os
 from numba import cuda
-import config_new as config
-import wind_gpu_new as wind_gpu
-import fire_gpu_new as fire_gpu
+import config_stable as config
+import wind_gpu_stable as wind_gpu
+import fire_gpu_stable as fire_gpu
 import gpu_utils
 import scipy.ndimage
 
@@ -11,7 +11,7 @@ def run_simulation(params, run_id, output_dir):
     # Unpack parameters
     wind_speed = params.get('wind_speed', 10.0)
     wind_dir_deg = params.get('wind_dir', 0.0)
-    moisture = params.get('moisture', 1.0)
+    moisture = params.get('moisture', 0.1) # Default 10% moisture
     ignition_points = params.get('ignition', [])
     
     nx, ny, nz = config.NX, config.NY, config.NZ
@@ -35,8 +35,10 @@ def run_simulation(params, run_id, output_dir):
         elevation_host = np.ascontiguousarray(params['custom_terrain'])
     else:
         elevation_host = np.zeros((nx, ny), dtype=np.float32)
-
-    elevation_physics = scipy.ndimage.gaussian_filter(elevation_host, sigma=1.5)
+        
+    # Convert integer indices to physical height in meters for wind solver
+    elevation_meters = elevation_host * dz
+    elevation_physics = scipy.ndimage.gaussian_filter(elevation_meters, sigma=1.0)
 
     z_coords_host = np.arange(nz) * dz
     wind_rad = np.radians(270 - wind_dir_deg)
@@ -69,7 +71,9 @@ def run_simulation(params, run_id, output_dir):
     ep_counts_dev = cuda.device_array((nx, ny, nz), dtype=np.int32)
     
     # MOISTURE SETUP
-    fuel_moisture_dev = cuda.to_device(np.ones((nx, ny, nz), dtype=np.float32) * moisture)
+    # Initialize grid with uniform moisture from params
+    fuel_moisture_host = np.ones((nx, ny, nz), dtype=np.float32) * moisture
+    fuel_moisture_dev = cuda.to_device(fuel_moisture_host)
 
     gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](reaction_rate_dev)
     gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](time_since_ignition_dev)
@@ -81,7 +85,9 @@ def run_simulation(params, run_id, output_dir):
         if isinstance(pt, dict): ix, iy, iz = pt['x'], pt['y'], pt['z']
         else: ix, iy, iz = pt
         if 0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz:
-            temp_ep[ix, iy, iz] = 5000
+            # High initial packet count to overcome moisture barrier
+            temp_ep[ix, iy, iz] = 10000 
+            
     n_ep_received_dev = cuda.to_device(temp_ep)
 
     if isinstance(run_id, str):
@@ -113,7 +119,6 @@ def run_simulation(params, run_id, output_dir):
     history_fuel = np.zeros((num_frames, nx, ny, nz), dtype=np.float16) 
     history_rr = np.zeros((num_frames, nx, ny, nz), dtype=np.float16)
     history_wind = np.zeros((num_frames, 3, 3, nx, ny), dtype=np.float16)
-    history_moisture = np.zeros((num_frames, nx, ny, nz), dtype=np.float16)
     
     vol = dx * dy * dz
     frame_idx = 0
@@ -127,6 +132,8 @@ def run_simulation(params, run_id, output_dir):
         )
         wind_gpu.rotate_wind_kernel[blocks_per_grid, threads_per_block](u_dev, v_dev, wind_rad)
         wind_gpu.reset_w_kernel[blocks_per_grid, threads_per_block](w_dev)
+        
+        # NOTE: Elevation passed here is in METERS
         wind_gpu.project_wind_over_terrain_kernel[blocks_per_grid, threads_per_block](
             u_dev, v_dev, w_dev, elevation_dev, dx, dy
         )
@@ -136,14 +143,14 @@ def run_simulation(params, run_id, output_dir):
             w_dev, reaction_rate_dev, dx, dy, dz, config.G, config.RHO_AIR, config.CP_AIR, config.T_AMBIENT, config.H_WOOD
         )
         
-        # 3. Fire Logic 
+        # 3. Fire Logic (PASS H_H2O_EFF)
         fire_gpu.compute_reaction_and_fuel_kernel[blocks_per_grid, threads_per_block](
             fuel_dev, fuel_moisture_dev, 
             n_ep_received_dev, incoming_x_dev, incoming_y_dev, incoming_z_dev,
             centroid_x_dev, centroid_y_dev, centroid_z_dev, ep_history_dev,
             time_since_ignition_dev, reaction_rate_dev, ep_counts_dev,
             config.DT, config.CM, config.T_BURNOUT, config.H_WOOD, vol, config.C_RAD_LOSS, config.EEP,
-            config.CP_WOOD, config.T_CRIT, config.T_AMBIENT, config.H_H2O_EFF
+            config.CP_WOOD, config.T_CRIT, config.T_AMBIENT#, config.H_H2O_EFF
         )
         
         gpu_utils.zero_array_3d[blocks_per_grid, threads_per_block](n_ep_received_dev)
@@ -164,7 +171,6 @@ def run_simulation(params, run_id, output_dir):
         if t % save_interval == 0 and frame_idx < num_frames:
             history_fuel[frame_idx] = fuel_dev.copy_to_host().astype(np.float16)
             history_rr[frame_idx] = reaction_rate_dev.copy_to_host().astype(np.float16)
-            history_moisture[frame_idx] = fuel_moisture_dev.copy_to_host().astype(np.float16)
             
             wind_gpu.extract_wind_slices_kernel[bpg_2d, tpb_2d](
                 u_dev, v_dev, w_dev, wind_snapshot_dev, z_indices_dev
@@ -181,7 +187,7 @@ def run_simulation(params, run_id, output_dir):
         wind_local=history_wind,
         wind_speed=np.array([wind_speed]),
         wind_dir=np.array([wind_dir_deg]),
-        moisture=history_moisture,
+        moisture=np.array([moisture]),
         terrain=elevation_host,
         wind_heights=np.array(target_heights)
     )
