@@ -28,7 +28,7 @@ def main():
     qf_config['origin_x'] = origin_x
     qf_config['origin_y'] = origin_y
     
-    nx, ny, nz = qf_config['nx'], qf_config['ny'], qf_config['nz']
+    nx, ny, nz = qf_config['nx'], qf_config['ny'], qf_config['nz_fire']
     
     print(f"Grid: {nx}x{ny}x{nz} | Origin: {origin_x}, {origin_y}")
     

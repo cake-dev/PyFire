@@ -60,13 +60,14 @@ class QuicFireIO:
             params['dt'] = int(lines[6].split('!')[0].split()[0])
             params['out_int_fire'] = int(lines[8].split('!')[0].split()[0])
             params['out_int_wind'] = int(lines[9].split('!')[0].split()[0])
+            params['nz_fire'] = int(lines[12].split('!')[0].split()[0])
             
             # File Format Flags (Lines 18, 19)
             # Line 18: fuel_file_type (1=all in one, 2=separate)
             # Line 19: fuel_file_format (1=stream, 2=fortran records)
             if len(lines) > 19:
                 params['fuel_file_type'] = int(lines[18].split('!')[0].split()[0])
-                params['fuel_file_format'] = int(lines[19].split('!')[0].split()[0])
+                params['fuel_file_format'] = 2#int(lines[19].split('!')[0].split()[0])
             else:
                 params['fuel_file_type'] = 1
                 params['fuel_file_format'] = 1 # Default to stream
