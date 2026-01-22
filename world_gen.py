@@ -97,7 +97,7 @@ def place_trees_cpu(fuel, terrain_z, nx, ny, nz, num_trees, seed):
         z_base = terrain_z[tx, ty]
         
         # Don't place trees if ground is too high or out of bounds
-        if z_base >= nz - 5: 
+        if z_base >= nz - 1: 
             continue
             
         tree_height = np.random.randint(8, 15)
